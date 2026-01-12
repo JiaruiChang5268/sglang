@@ -94,7 +94,9 @@ def forward_mha_prepare_npu(
     )  # adapter NZ
 
     k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
-
+    forward_batch.token_to_kv_pool.set_kv_buffer(
+        m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+    )
     q[..., m.qk_nope_head_dim :] = q_pe
 
     kv = m.kv_b_proj(kv_a)[0]
