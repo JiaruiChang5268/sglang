@@ -19,6 +19,7 @@ import inspect
 from typing import Dict, Hashable, List, Optional, Tuple
 
 import torch
+import torch_npu
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -27,18 +28,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.server_args import get_global_server_args
-
-
-vit_graph_memory_pool = None
-
-
-def get_vit_graph_memory_pool():
-    return vit_graph_memory_pool
-
-
-def set_vit_graph_memory_pool(val):
-    global vit_graph_memory_pool
-    vit_graph_memory_pool = val
 
 
 class ViTNpuGraphRunner(ViTCudaGraphRunner):
@@ -51,6 +40,7 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
       - vit.deepstack_vision_indexes: Sequence[int]
       - vit.deepstack_merger_list: nn.ModuleList (same length as deepstack_vision_indexes)
     """
+    _graph_memory_pool = None
 
     def __init__(
         self,
@@ -76,11 +66,11 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         graph_key: int,
     ):
 
-        graph = torch.cuda.CUDAGraph()
+        graph = torch_npu.npu.CUDAGraph()
         vit = self.vit
 
         override_backend = get_global_server_args().mm_attention_backend
-        with torch.cuda.graph(graph, pool=get_vit_graph_memory_pool()):
+        with torch_npu.npu.graph(graph, pool=ViTNpuGraphRunner._graph_memory_pool):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -169,10 +159,10 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         if graph_key in self.block_graphs:
             return graph_key
 
-        if get_vit_graph_memory_pool() is None:
-            set_vit_graph_memory_pool(self.device_module.graph_pool_handle())
+        if ViTNpuGraphRunner._graph_memory_pool is None:
+            ViTNpuGraphRunner._graph_memory_pool = self.device_module.graph_pool_handle()
         # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_vit_graph_memory_pool())
+        set_graph_pool_id(ViTNpuGraphRunner._graph_memory_pool)
 
         # pre-allocate workspace
         attn_module: VisionAttention = vit.blocks[0].attn
