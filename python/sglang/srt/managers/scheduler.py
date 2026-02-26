@@ -1150,6 +1150,40 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        enable_profiling = envs.SGLANG_NPU_PROFILING.get() and self.tp_rank == 0
+        prof_bs = envs.SGLANG_NPU_PROFILING_BS.get()
+        prof_step = envs.SGLANG_NPU_PROFILING_STEP.get()
+        profiling_stage: str = envs.SGLANG_NPU_PROFILING_STAGE.get()
+        if enable_profiling:
+            prof_cnt = 0
+            import torch_npu
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            profiling_path = "profiling/"
+            prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    profiling_path
+                ),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True,
+                with_modules=True,
+                experimental_config=experimental_config,
+            )
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1169,8 +1203,28 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if enable_profiling:
+                    is_prof_stage = False
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
+                        is_prof_stage = True
+
+                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
+                        prof.start()
+                        prof_cnt += 1
+                    if prof_cnt > 0 and is_prof_stage:
+                        prof_cnt += 1
+                    if prof_cnt == prof_step and is_prof_stage:
+                        torch.npu.synchronize()
+                        prof.stop()
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+
+                if enable_profiling and 0 < prof_cnt < prof_step and is_prof_stage:
+                    prof.step()
             else:
                 batch_result = None
 
