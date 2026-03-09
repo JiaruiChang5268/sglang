@@ -21,6 +21,35 @@ except ImportError:
     swiglu_quant = None
 
 
+def _use_custom_swiglu_quant(layer) -> bool:
+    return getattr(layer, "_sglang_decode_phase", False)
+
+
+def _fallback_swiglu(hidden_states: torch.Tensor, need_quant: bool = True):
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    if need_quant:
+        hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_quant(
+            hidden_states
+        )
+        return hidden_states, hidden_states_scale
+    return hidden_states, None
+
+
+def _apply_swiglu_quant(
+    layer,
+    hidden_states: torch.Tensor,
+    group_list,
+    group_list_type,
+    *,
+    need_quant: bool = True,
+):
+    if _swiglu_quant_available and _use_custom_swiglu_quant(layer):
+        return swiglu_quant(
+            hidden_states, group_list, group_list_type, need_quant=need_quant
+        )
+    return _fallback_swiglu(hidden_states, need_quant=need_quant)
+
+
 def npu_fused_experts(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -132,12 +161,13 @@ def npu_fused_moe_without_routing_weights_bf16(
         group_list=group_list,
         output_dtype=output_dtype,
     )[0]
-    if _swiglu_quant_available:
-        hidden_states, _ = swiglu_quant(
-            hidden_states, group_list, group_list_type, need_quant=False
-        )
-    else:
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, _ = _apply_swiglu_quant(
+        layer,
+        hidden_states,
+        group_list,
+        group_list_type,
+        need_quant=False,
+    )
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -549,7 +579,6 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
-        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -564,8 +593,11 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             output_dtype=output_dtype,
         )[0]
 
-        hidden_states, swiglu_out_scale = swiglu_quant(
-            hidden_states, group_list, group_list_type
+        hidden_states, swiglu_out_scale = _apply_swiglu_quant(
+            layer,
+            hidden_states,
+            group_list,
+            group_list_type,
         )
 
         hidden_states = torch.ops.npu.npu_grouped_matmul(

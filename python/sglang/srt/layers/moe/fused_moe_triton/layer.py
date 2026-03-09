@@ -313,6 +313,10 @@ class FusedMoE(torch.nn.Module):
 
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+        self._sglang_decode_phase = False
+
+    def set_forward_phase(self, *, is_decode: bool) -> None:
+        self._sglang_decode_phase = is_decode
 
     def _load_per_tensor_weight_scale(
         self,

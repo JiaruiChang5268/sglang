@@ -262,6 +262,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
+    def _set_experts_forward_phase(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        self.experts.set_forward_phase(
+            is_decode=(
+                forward_batch is not None and forward_batch.forward_mode.is_decode()
+            )
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -269,6 +278,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        self._set_experts_forward_phase(forward_batch)
 
         if (
             not get_moe_a2a_backend().is_deepep()
