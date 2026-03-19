@@ -1,4 +1,4 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
+﻿# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
 
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -42,22 +42,23 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
+    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
+    is_host_cpu_arm64,
     is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1581,6 +1582,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_SHM_INITIALIZED = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1612,59 +1614,138 @@ def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
-def _create_global_tcp_store(rank: int, world_size: int) -> None:
-    """Create a global TCPStore for coordination across ranks.
+def _maybe_init_tp_shmem(tp_group: GroupCoordinator, tp_size: int) -> None:
+    """Initialize CPU shared-memory allreduce runtime once per process."""
+    global _SHM_INITIALIZED
+    if _SHM_INITIALIZED:
+        return
+    if not _is_cpu:
+        return
+    if not (cpu_has_amx_support() or is_host_cpu_arm64()):
+        return
 
-    This function creates a TCPStore that all ranks can use for coordination
-    (e.g., for NIXL buffer setup).
-    """
-    from torch.distributed import TCPStore
-
-    master_ip = os.environ.get("MASTER_ADDR")
-
-    if not master_ip:
+    # Hint SHM allreduce runtime about local group size and rank.
+    os.environ["LOCAL_SIZE"] = str(tp_size)
+    if not hasattr(torch.ops, "sgl_kernel") or not hasattr(
+        torch.ops.sgl_kernel, "initialize"
+    ):
         logger.warning(
-            "Could not determine master IP for global TCPStore. "
-            "Broadcasting from rank 0 to all ranks."
+            "sgl_kernel::initialize is not available; SHM allreduce runtime is not initialized."
         )
+        return
+    torch.ops.sgl_kernel.initialize(tp_size, tp_group.rank_in_group)
+    _SHM_INITIALIZED = True
 
-    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
-    # Rank 0 gets its local IP and broadcasts it to all ranks
-    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
-    if not master_ip:
-        if rank == 0:
-            master_ip = get_local_ip_auto()
-            ip_list = [master_ip]
-        else:
-            ip_list = [None]
+# Global NPU catcoc shmem state
+_NPU_CATCOC_INITIALIZED = False
+_NPU_CATCOC_SHMEM_ADDR = None
 
-        torch.distributed.broadcast_object_list(ip_list, src=0)
-        master_ip = ip_list[0]
 
+def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> None:
+    """Initialize NPU catcoc shared-memory runtime once per process."""
+    global _NPU_CATCOC_INITIALIZED, _NPU_CATCOC_SHMEM_ADDR
+
+    if _NPU_CATCOC_INITIALIZED:
+        return
+
+    # Check if NPU catcoc optimization should be enabled
     try:
-        tcp_store = TCPStore(
-            host_name=master_ip,
-            port=base_store_port,
-            world_size=world_size,
-            is_master=(rank == 0),
-        )
-        set_global_tcp_store(tcp_store)
+
+        if not torch.npu.is_available():
+            return
+        if tp_size <= 1:
+            return
+        if not (
+            hasattr(torch.ops, "npu")
+            and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
+        ):
+            return
+
+        import shmem as ash
+
+        rank = tp_group.rank_in_group
+        shmem_size = int(
+            os.environ.get("CATCOC_SHMEM_SIZE", str(1024 * 1024 * 1024))
+        )  # 1GB default
+
+        logger.info(f"Initializing NPU catcoc shmem for rank {rank}/{tp_size}")
+
+        # Disable TLS
+        ash.set_conf_store_tls(False, "")
+
+        # Choose initialization method
+        use_ip_method = os.environ.get("CATCOC_USE_IP_INIT", "false").lower() == "true"
+
+        if use_ip_method:
+            # Method 1: IP-based initialization
+            shmem_addr = os.environ.get("CATCOC_SHMEM_ADDR", "tcp://127.0.0.1:26666")
+            attributes = ash.InitAttr()
+            attributes.my_rank = rank
+            attributes.n_ranks = tp_size
+            attributes.local_mem_size = shmem_size * 2
+            attributes.ip_port = shmem_addr
+            attributes.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+            ret = ash.shmem_init(attributes)
+            if ret != 0:
+                logger.warning(f"NPU catcoc shmem_init failed: {ret}")
+                return
+        else:
+            # Method 2: Unique ID initialization (default)
+            uid_size = 512
+            device_id = torch.npu.current_device()
+            tensor = torch.zeros(uid_size, dtype=torch.uint8, device=f"npu:{device_id}")
+
+            if rank == 0:
+                unique_id = ash.shmem_get_unique_id()
+                if unique_id is not None:
+                    uid_list = [0] * uid_size
+                    uid_list[: len(unique_id)] = unique_id
+                    tensor = torch.tensor(
+                        uid_list, dtype=torch.uint8, device=f"npu:{device_id}"
+                    )
+
+            # Broadcast unique_id using TP group
+            if rank == 0:
+                # rank 0 has the unique_id, others will get zeros
+                pass
+            tp_group.all_reduce(
+                tensor
+            )  # This will sum, but rank 0's data will dominate
+            torch.npu.synchronize()
+
+            if rank != 0:
+                unique_id = bytes(tensor.cpu().tolist())
+
+            # Initialize with unique ID
+            ret = ash.shmem_init_using_unique_id(
+                rank, tp_size, shmem_size * 2, unique_id
+            )
+            if ret != 0:
+                logger.warning(f"NPU catcoc shmem_init_using_unique_id failed: {ret}")
+                return
+
+        # Allocate shared memory
+        _NPU_CATCOC_SHMEM_ADDR = ash.shmem_malloc(shmem_size)
+        if _NPU_CATCOC_SHMEM_ADDR is None:
+            logger.warning("NPU catcoc shmem_malloc failed")
+            return
+
+        _NPU_CATCOC_INITIALIZED = True
+        method_name = "IP-based" if use_ip_method else "Unique-ID"
         logger.info(
-            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
-            master_ip,
-            base_store_port,
-            rank,
-            world_size,
+            f"NPU catcoc shmem initialized using {method_name} method for rank {rank}, addr: {_NPU_CATCOC_SHMEM_ADDR}"
         )
+
+    except ImportError as e:
+        logger.debug(f"NPU catcoc dependencies not available: {e}")
     except Exception as e:
-        logger.warning(
-            "Failed to create global TCPStore at %s:%d: %s. "
-            "Components requiring TCPStore (like NIXL) may not work.",
-            master_ip,
-            base_store_port,
-            e,
-        )
+        logger.warning(f"Failed to initialize NPU catcoc shmem: {e}")
+
+
+def get_npu_catcoc_shmem_addr():
+    """Get the global NPU catcoc shared memory address."""
+    return _NPU_CATCOC_SHMEM_ADDR if _NPU_CATCOC_INITIALIZED else None
 
 
 def init_distributed_environment(
@@ -1674,7 +1755,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
     timeout: Optional[int] = None,
-    moe_a2a_backend: Optional[str] = None,
+    moe_a2a_backend: str = "none",
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1717,10 +1798,6 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
-            _create_global_tcp_store(rank, world_size)
-
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -1739,6 +1816,34 @@ def init_distributed_environment(
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
         ), "world group already initialized with a different world size"
+
+    # Initialize MOE configuration
+    if moe_a2a_backend != "none":
+        from sglang.srt.layers.moe.utils import initialize_moe_config
+
+        # Create a minimal config object for MOE initialization
+        class MinimalMoeConfig:
+            def __init__(self, moe_a2a_backend_val):
+                self.moe_a2a_backend = moe_a2a_backend_val
+                self.moe_runner_backend = "auto"  # default
+                self.speculative_moe_runner_backend = None
+                self.speculative_moe_a2a_backend = None
+                self.deepep_mode = "auto"
+                self.deepep_config = ""
+                self.enable_two_batch_overlap = False
+                self.enable_single_batch_overlap = False
+                self.tbo_token_distribution_threshold = 0.0
+                self.disable_flashinfer_cutlass_moe_fp4_allgather = False
+                self.quantization = None
+
+        try:
+            moe_config = MinimalMoeConfig(moe_a2a_backend)
+            initialize_moe_config(moe_config)
+            logger.info(f"Initialized MOE A2A backend: {moe_a2a_backend}")
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize MOE A2A backend {moe_a2a_backend}: {e}"
+            )
 
 
 def initialize_model_parallel(
@@ -2015,6 +2120,10 @@ def initialize_model_parallel(
         group_name="pp",
     )
 
+    # Initialize shared memory runtimes after all parallel groups are set up
+    _maybe_init_tp_shmem(_TP, tensor_model_parallel_size)
+    _maybe_init_npu_catcoc_shmem(_TP, tensor_model_parallel_size)
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2242,11 +2351,6 @@ def destroy_model_parallel():
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
-
-    global _ATTN_TP
-    if _ATTN_TP:
-        _ATTN_TP.destroy()
-    _ATTN_TP = None
 
     global _MOE_DP
     if _MOE_DP:

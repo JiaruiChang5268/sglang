@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_npu_catcoc_shmem_addr,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -150,11 +151,13 @@ class Qwen2MLP(nn.Module):
         """Check if catcoc matmul allreduce should be used."""
         try:
             tp_size = get_tensor_model_parallel_world_size()
+            shmem_addr = get_npu_catcoc_shmem_addr()
 
-            # Enable catcoc optimization for multi-device NPU setup
+            # Enable catcoc optimization for multi-device NPU setup with initialized shmem
             return (
                 torch.npu.is_available()
                 and tp_size > 1
+                and shmem_addr is not None
                 and hasattr(torch.ops, "npu")
                 and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
                 and hasattr(
@@ -165,13 +168,14 @@ class Qwen2MLP(nn.Module):
             return False
 
     def _catcoc_matmul_allreduce(self, x: torch.Tensor) -> torch.Tensor:
-        """Perform catcoc matmul allreduce operation."""
+        """Perform catcoc matmul allreduce operation using global shmem."""
         try:
             import torch_npu
 
-            # Initialize shared memory if not done
-            if not hasattr(self, "_shmem_addr") or self._shmem_addr is None:
-                self._init_catcoc_shmem()
+            # Get global shmem address
+            shmem_addr = get_npu_catcoc_shmem_addr()
+            if shmem_addr is None:
+                raise RuntimeError("NPU catcoc shmem not initialized")
 
             # Prepare tensors
             original_shape = x.shape
@@ -186,17 +190,24 @@ class Qwen2MLP(nn.Module):
                 x.shape[0], weight.shape[1], dtype=x.dtype, device=x.device
             ).contiguous()
 
-            # Use NZ format for better performance
-            try:
-                weight_nz = torch_npu.npu_format_cast(weight, 29)
-                torch.ops.npu.catcoc_matmul_allreduce(
-                    x, weight_nz, output, self._shmem_addr, 0, format_mode="NZ"
-                )
-            except Exception:
-                # Fallback to standard format
-                torch.ops.npu.catcoc_matmul_allreduce(
-                    x, weight, output, self._shmem_addr, 0
-                )
+            # Use NZ format for better performance if enabled
+            use_nz_format = (
+                not os.environ.get("CATCOC_DISABLE_NZ", "false").lower() == "true"
+            )
+
+            if use_nz_format:
+                try:
+                    weight_nz = torch_npu.npu_format_cast(weight, 29)
+                    torch.ops.npu.catcoc_matmul_allreduce(
+                        x, weight_nz, output, shmem_addr, 0, format_mode="NZ"
+                    )
+                except Exception:
+                    # Fallback to standard format
+                    torch.ops.npu.catcoc_matmul_allreduce(
+                        x, weight, output, shmem_addr, 0
+                    )
+            else:
+                torch.ops.npu.catcoc_matmul_allreduce(x, weight, output, shmem_addr, 0)
 
             torch.npu.synchronize()
 
@@ -213,107 +224,6 @@ class Qwen2MLP(nn.Module):
             # Fallback to standard approach
             x, _ = self.down_proj(x)
             return x
-
-    def _init_catcoc_shmem(self):
-        """Initialize shared memory for catcoc operations."""
-        try:
-            import shmem as ash
-            import torch.distributed as dist
-
-            if hasattr(self, "_shmem_initialized") and self._shmem_initialized:
-                return
-
-            rank = get_tensor_model_parallel_rank()
-            world_size = get_tensor_model_parallel_world_size()
-            shmem_size = 1024 * 1024 * 1024  # 1GB
-
-            # Disable TLS
-            ash.set_conf_store_tls(False, "")
-
-            # Choose initialization method based on environment
-            use_ip_method = (
-                os.environ.get("CATCOC_USE_IP_INIT", "false").lower() == "true"
-            )
-
-            if use_ip_method:
-                # Method 1: Traditional IP-based initialization
-                shmem_addr = os.environ.get(
-                    "CATCOC_SHMEM_ADDR", "tcp://127.0.0.1:26666"
-                )
-                attributes = ash.InitAttr()
-                attributes.my_rank = rank
-                attributes.n_ranks = world_size
-                attributes.local_mem_size = shmem_size * 2
-                attributes.ip_port = shmem_addr
-                attributes.option_attr.data_op_engine_type = ash.OpEngineType.MTE
-                ret = ash.shmem_init(attributes)
-                if ret != 0:
-                    raise ValueError("[ERROR] shmem_init failed")
-            else:
-                # Method 2: Unique ID initialization (default)
-                if world_size > 1:
-                    uid_size = 512
-                    device_id = torch.npu.current_device()
-                    tensor = torch.zeros(
-                        uid_size, dtype=torch.uint8, device=f"npu:{device_id}"
-                    )
-
-                    if rank == 0:
-                        unique_id = ash.shmem_get_unique_id()
-                        if unique_id is not None:
-                            uid_list = [0] * uid_size
-                            uid_list[: len(unique_id)] = unique_id
-                            tensor = torch.tensor(
-                                uid_list, dtype=torch.uint8, device=f"npu:{device_id}"
-                            )
-
-                    # Broadcast unique_id if distributed is available
-                    if dist.is_initialized():
-                        dist.broadcast(tensor, src=0)
-                        torch.npu.synchronize()
-
-                    if rank != 0:
-                        unique_id = bytes(tensor.cpu().tolist())
-
-                    # Initialize with unique ID
-                    ret = ash.shmem_init_using_unique_id(
-                        rank, world_size, shmem_size * 2, unique_id
-                    )
-                    if ret != 0:
-                        raise ValueError("[ERROR] shmem_init failed")
-
-            # Allocate shared memory
-            self._shmem_addr = ash.shmem_malloc(shmem_size)
-            if self._shmem_addr is None:
-                raise ValueError("[ERROR] shmem_malloc failed")
-
-            self._shmem_initialized = True
-            method_name = "IP-based" if use_ip_method else "Unique-ID"
-            logger.info(
-                f"Initialized catcoc shmem using {method_name} method for rank {rank}, addr: {self._shmem_addr}"
-            )
-
-        except Exception as e:
-            logger.warning(f"Failed to initialize catcoc shmem: {e}")
-            self._shmem_addr = None
-            self._shmem_initialized = False
-
-    def __del__(self):
-        """Cleanup shared memory on object destruction."""
-        if (
-            hasattr(self, "_shmem_initialized")
-            and self._shmem_initialized
-            and hasattr(self, "_shmem_addr")
-        ):
-            try:
-                import shmem as ash
-
-                if self._shmem_addr is not None:
-                    ash.shmem_free(self._shmem_addr)
-                    ash.shmem_finialize()
-            except Exception as e:
-                # Ignore cleanup errors during destruction
-                pass
 
     def forward(self, x):
         if get_global_server_args().rl_on_policy_target is not None:
