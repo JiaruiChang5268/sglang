@@ -84,16 +84,16 @@ class CatcocRowParallelLinear(LinearBase):
         # Create weight parameter
         self.weight = Parameter(
             torch.empty(
-                self.input_size_per_partition,
                 self.output_size,
+                self.input_size_per_partition,
                 dtype=params_dtype or torch.float16,
             )
         )
         set_weight_attrs(
             self.weight,
             {
-                "input_dim": 0,
-                "output_dim": 1,
+                "input_dim": 1,  # Fixed: input dimension is 1, not 0
+                "output_dim": 0,  # Fixed: output dimension is 0, not 1
                 "packed_dim": self.input_size,
                 "pack_factor": 1,
                 "weight_loader": self.weight_loader,
