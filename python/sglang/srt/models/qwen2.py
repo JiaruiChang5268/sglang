@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -35,6 +36,14 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+
+# NPU-specific optimizations
+try:
+    from sglang.srt.layers.npu_linear import CatcocRowParallelLinear
+
+    _NPU_LINEAR_AVAILABLE = True
+except ImportError:
+    _NPU_LINEAR_AVAILABLE = False
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,9 +60,14 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_npu,
+    make_layers,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_is_npu = is_npu()
 Qwen2Config = None
 
 
@@ -77,13 +91,28 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
+
+        # Use NPU-optimized layer if available and running on NPU
+        use_npu_optimized = self._should_use_npu_optimized(quant_config)
+
+        if use_npu_optimized:
+            self.down_proj = CatcocRowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+                use_nz_format=True,  # Enable NZ format for better performance
+            )
+        else:
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -91,13 +120,215 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+    def _should_use_npu_optimized(
+        self, quant_config: Optional[QuantizationConfig] = None
+    ) -> bool:
+        """Check if NPU-optimized layer should be used."""
+        if not _NPU_LINEAR_AVAILABLE:
+            return False
+
+        # Don't use if quantization is enabled (not supported yet)
+        if quant_config is not None:
+            return False
+
+        try:
+            # Check if current device is NPU and multi-device setup
+            current_device = torch.device("npu" if torch.npu.is_available() else "cpu")
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # Enable NPU optimization for multi-device NPU setup
+            return (
+                torch.npu.is_available()
+                and tp_size > 1
+                and hasattr(torch.ops, "npu")
+                and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
+            )
+        except (ImportError, AttributeError):
+            return False
+
+    def _should_use_catcoc_matmul(self) -> bool:
+        """Check if catcoc matmul allreduce should be used."""
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # Enable catcoc optimization for multi-device NPU setup
+            return (
+                torch.npu.is_available()
+                and tp_size > 1
+                and hasattr(torch.ops, "npu")
+                and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
+                and hasattr(
+                    self.down_proj, "weight"
+                )  # Ensure standard RowParallelLinear
+            )
+        except (ImportError, AttributeError):
+            return False
+
+    def _catcoc_matmul_allreduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Perform catcoc matmul allreduce operation."""
+        try:
+            import torch_npu
+
+            # Initialize shared memory if not done
+            if not hasattr(self, "_shmem_addr") or self._shmem_addr is None:
+                self._init_catcoc_shmem()
+
+            # Prepare tensors
+            original_shape = x.shape
+            if x.dim() > 2:
+                x = x.view(-1, x.shape[-1])
+
+            # Get weight from down_proj
+            weight = self.down_proj.weight.t().contiguous()
+
+            # Prepare output
+            output = torch.empty(
+                x.shape[0], weight.shape[1], dtype=x.dtype, device=x.device
+            ).contiguous()
+
+            # Use NZ format for better performance
+            try:
+                weight_nz = torch_npu.npu_format_cast(weight, 29)
+                torch.ops.npu.catcoc_matmul_allreduce(
+                    x, weight_nz, output, self._shmem_addr, 0, format_mode="NZ"
+                )
+            except Exception:
+                # Fallback to standard format
+                torch.ops.npu.catcoc_matmul_allreduce(
+                    x, weight, output, self._shmem_addr, 0
+                )
+
+            torch.npu.synchronize()
+
+            # Restore original shape
+            if len(original_shape) > 2:
+                output = output.view(*original_shape[:-1], output.shape[-1])
+
+            return output
+
+        except Exception as e:
+            logger.warning(
+                f"Catcoc operation failed: {e}, falling back to standard approach"
+            )
+            # Fallback to standard approach
+            x, _ = self.down_proj(x)
+            return x
+
+    def _init_catcoc_shmem(self):
+        """Initialize shared memory for catcoc operations."""
+        try:
+            import shmem as ash
+            import torch.distributed as dist
+
+            if hasattr(self, "_shmem_initialized") and self._shmem_initialized:
+                return
+
+            rank = get_tensor_model_parallel_rank()
+            world_size = get_tensor_model_parallel_world_size()
+            shmem_size = 1024 * 1024 * 1024  # 1GB
+
+            # Disable TLS
+            ash.set_conf_store_tls(False, "")
+
+            # Choose initialization method based on environment
+            use_ip_method = (
+                os.environ.get("CATCOC_USE_IP_INIT", "false").lower() == "true"
+            )
+
+            if use_ip_method:
+                # Method 1: Traditional IP-based initialization
+                shmem_addr = os.environ.get(
+                    "CATCOC_SHMEM_ADDR", "tcp://127.0.0.1:26666"
+                )
+                attributes = ash.InitAttr()
+                attributes.my_rank = rank
+                attributes.n_ranks = world_size
+                attributes.local_mem_size = shmem_size * 2
+                attributes.ip_port = shmem_addr
+                attributes.option_attr.data_op_engine_type = ash.OpEngineType.MTE
+                ret = ash.shmem_init(attributes)
+                if ret != 0:
+                    raise ValueError("[ERROR] shmem_init failed")
+            else:
+                # Method 2: Unique ID initialization (default)
+                if world_size > 1:
+                    uid_size = 512
+                    device_id = torch.npu.current_device()
+                    tensor = torch.zeros(
+                        uid_size, dtype=torch.uint8, device=f"npu:{device_id}"
+                    )
+
+                    if rank == 0:
+                        unique_id = ash.shmem_get_unique_id()
+                        if unique_id is not None:
+                            uid_list = [0] * uid_size
+                            uid_list[: len(unique_id)] = unique_id
+                            tensor = torch.tensor(
+                                uid_list, dtype=torch.uint8, device=f"npu:{device_id}"
+                            )
+
+                    # Broadcast unique_id if distributed is available
+                    if dist.is_initialized():
+                        dist.broadcast(tensor, src=0)
+                        torch.npu.synchronize()
+
+                    if rank != 0:
+                        unique_id = bytes(tensor.cpu().tolist())
+
+                    # Initialize with unique ID
+                    ret = ash.shmem_init_using_unique_id(
+                        rank, world_size, shmem_size * 2, unique_id
+                    )
+                    if ret != 0:
+                        raise ValueError("[ERROR] shmem_init failed")
+
+            # Allocate shared memory
+            self._shmem_addr = ash.shmem_malloc(shmem_size)
+            if self._shmem_addr is None:
+                raise ValueError("[ERROR] shmem_malloc failed")
+
+            self._shmem_initialized = True
+            method_name = "IP-based" if use_ip_method else "Unique-ID"
+            logger.info(
+                f"Initialized catcoc shmem using {method_name} method for rank {rank}, addr: {self._shmem_addr}"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize catcoc shmem: {e}")
+            self._shmem_addr = None
+            self._shmem_initialized = False
+
+    def __del__(self):
+        """Cleanup shared memory on object destruction."""
+        if (
+            hasattr(self, "_shmem_initialized")
+            and self._shmem_initialized
+            and hasattr(self, "_shmem_addr")
+        ):
+            try:
+                import shmem as ash
+
+                if self._shmem_addr is not None:
+                    ash.shmem_free(self._shmem_addr)
+                    ash.shmem_finialize()
+            except Exception as e:
+                # Ignore cleanup errors during destruction
+                pass
+
     def forward(self, x):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+
+        # Check if NPU catcoc optimization should be used
+        use_catcoc_matmul = self._should_use_catcoc_matmul()
+
+        if use_catcoc_matmul:
+            x = self._catcoc_matmul_allreduce(x)
+        else:
+            x, _ = self.down_proj(x)
         return x
 
 
