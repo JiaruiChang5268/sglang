@@ -48,7 +48,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
-    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -59,6 +58,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1693,7 +1693,7 @@ def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> No
             attributes.local_mem_size = shmem_size * 2
             attributes.ip_port = shmem_addr
             attributes.option_attr.data_op_engine_type = ash.OpEngineType.MTE
-            ret = ash.shmem_init(attributes)
+            ret = ash.aclshmem_init(attributes)
             if ret != 0:
                 logger.warning(f"NPU catcoc shmem_init failed: {ret}")
                 return
@@ -1704,7 +1704,7 @@ def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> No
             tensor = torch.zeros(uid_size, dtype=torch.uint8, device=f"npu:{device_id}")
 
             if rank == 0:
-                unique_id = ash.shmem_get_unique_id()
+                unique_id = ash.aclshmem_get_unique_id()
                 if unique_id is not None:
                     uid_list = [0] * uid_size
                     uid_list[: len(unique_id)] = unique_id
@@ -1725,7 +1725,7 @@ def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> No
                 unique_id = bytes(tensor.cpu().tolist())
 
             # Initialize with unique ID
-            ret = ash.shmem_init_using_unique_id(
+            ret = ash.aclshmem_init_using_unique_id(
                 rank, tp_size, shmem_size * 2, unique_id
             )
             if ret != 0:
@@ -1733,7 +1733,7 @@ def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> No
                 return
 
         # Allocate shared memory
-        _NPU_CATCOC_SHMEM_ADDR = ash.shmem_malloc(shmem_size)
+        _NPU_CATCOC_SHMEM_ADDR = ash.aclshmem_malloc(shmem_size)
         if _NPU_CATCOC_SHMEM_ADDR is None:
             logger.warning("NPU catcoc shmem_malloc failed")
             return
