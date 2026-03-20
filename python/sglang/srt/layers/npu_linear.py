@@ -7,7 +7,6 @@ import torch
 from torch.nn import Parameter
 
 try:
-    import shmem as ash
     import torch_npu
 
     _NPU_AVAILABLE = True
@@ -18,6 +17,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.distributed.parallel_state import get_npu_catcoc_shmem_addr
 from sglang.srt.distributed.utils import split_tensor_along_last_dim
 from sglang.srt.layers.linear import LinearBase, divide
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -76,10 +76,9 @@ class CatcocRowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.use_presharded_weights = use_presharded_weights
 
-        # Shared memory setup
+        # Shared memory setup - use global shmem instead of local initialization
         self.shmem_size = shmem_size
-        self.shmem_addr = None
-        self._shmem_initialized = False
+        self.shmem_addr = None  # Will be set from global state in forward
 
         # Create weight parameter
         self.weight = Parameter(
@@ -113,82 +112,6 @@ class CatcocRowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def _init_shmem(self):
-        """Initialize shared memory for the catcoc operations."""
-        if self._shmem_initialized:
-            return
-
-        try:
-            # Initialize shared memory using the same approach as the test
-            ash.set_conf_store_tls(False, "")
-
-            # For NPU distributed setup, we can use unique ID approach
-            if self.tp_size > 1:
-                uid_size = 512
-                device_id = torch.npu.current_device()
-                tensor = torch.zeros(
-                    uid_size, dtype=torch.uint8, device=f"npu:{device_id}"
-                )
-
-                if self.tp_rank == 0:
-                    unique_id = ash.shmem_get_unique_id()
-                    if unique_id is None:
-                        raise ValueError("[ERROR] get unique id failed")
-                    uid_list = [0] * uid_size
-                    uid_list[: len(unique_id)] = unique_id
-                    tensor = torch.tensor(
-                        uid_list, dtype=torch.uint8, device=f"npu:{device_id}"
-                    )
-
-                # Use torch.distributed to broadcast unique_id
-                try:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized():
-                        dist.broadcast(tensor, src=0)
-                        torch.npu.synchronize()
-                except ImportError:
-                    logger.warning(
-                        "torch.distributed not available, using fallback shmem init"
-                    )
-
-                if self.tp_rank != 0:
-                    unique_id = bytes(tensor.cpu().tolist())
-
-                # Initialize with unique ID
-                ret = ash.shmem_init_using_unique_id(
-                    self.tp_rank, self.tp_size, self.shmem_size * 2, unique_id
-                )
-                if ret != 0:
-                    raise ValueError("[ERROR] shmem_init failed")
-            else:
-                # Single device case - still initialize for consistency
-                attributes = ash.InitAttr()
-                attributes.my_rank = 0
-                attributes.n_ranks = 1
-                attributes.local_mem_size = self.shmem_size * 2
-                attributes.ip_port = "tcp://127.0.0.1:26666"
-                attributes.option_attr.data_op_engine_type = ash.OpEngineType.MTE
-                ret = ash.shmem_init(attributes)
-                if ret != 0:
-                    raise ValueError("[ERROR] shmem_init failed")
-
-            # Allocate shared memory
-            self.shmem_addr = ash.shmem_malloc(self.shmem_size)
-            if self.shmem_addr is None:
-                raise ValueError("[ERROR] shmem_malloc failed")
-
-            self._shmem_initialized = True
-            logger.info(
-                f"Initialized shmem for rank {self.tp_rank}, addr: {self.shmem_addr}"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to initialize shmem: {e}")
-            # Fallback: disable catcoc operations
-            self.shmem_addr = None
-            self._shmem_initialized = False
-
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         """Load weight with proper sharding for row parallelism."""
         input_dim = getattr(param, "input_dim", None)
@@ -219,8 +142,9 @@ class CatcocRowParallelLinear(LinearBase):
 
     def forward(self, input_: torch.Tensor):
         """Forward pass using catcoc_matmul_allreduce when available."""
-        if not self._shmem_initialized:
-            self._init_shmem()
+        # Get global shmem address (only once per forward call)
+        if self.shmem_addr is None:
+            self.shmem_addr = get_npu_catcoc_shmem_addr()
 
         # Handle input sharding
         if self.input_is_parallel:
@@ -306,12 +230,3 @@ class CatcocRowParallelLinear(LinearBase):
 
         bias_out = self.bias if self.skip_bias_add else None
         return output, bias_out
-
-    def __del__(self):
-        """Cleanup shared memory on destruction."""
-        if self._shmem_initialized and self.shmem_addr is not None:
-            try:
-                ash.shmem_free(self.shmem_addr)
-                ash.shmem_finialize()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup shmem: {e}")

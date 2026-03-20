@@ -1679,6 +1679,13 @@ def _maybe_init_npu_catcoc_shmem(tp_group: GroupCoordinator, tp_size: int) -> No
 
         if use_ip_method:
             # Method 1: IP-based initialization
+            # Set network interface for UID sock communication
+            ifname = os.environ.get("SHMEM_UID_SOCK_IFNAM", "")
+            if ifname:
+                # Format: interface::inet4 or interface::inet6
+                ash.set_conf_store_tls(True, ifname)
+                logger.info(f"Using network interface for shmem: {ifname}")
+
             shmem_addr = os.environ.get("CATCOC_SHMEM_ADDR", "tcp://127.0.0.1:26666")
             attributes = ash.InitAttr()
             attributes.my_rank = rank
