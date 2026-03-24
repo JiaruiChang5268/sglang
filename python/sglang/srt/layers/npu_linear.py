@@ -6,12 +6,7 @@ from typing import Optional
 import torch
 from torch.nn import Parameter
 
-try:
-    import torch_npu
-
-    _NPU_AVAILABLE = True
-except ImportError:
-    _NPU_AVAILABLE = False
+_NPU_AVAILABLE = True
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -99,6 +94,10 @@ class CatcocRowParallelLinear(LinearBase):
             },
         )
 
+        # Cache for pre-transposed weight to avoid transpose in forward
+        self._weight_t_cache = None
+        self._weight_nz_cache = None
+
         # Create bias if needed
         if bias:
             self.bias = Parameter(torch.zeros(self.output_size, dtype=params_dtype))
@@ -140,30 +139,55 @@ class CatcocRowParallelLinear(LinearBase):
         ), f"{param_data.shape=} {loaded_weight.shape=}"
         param_data.copy_(loaded_weight)
 
+        # Pre-compute transposed weight if this is the weight parameter
+        if param is self.weight:
+            self._update_weight_caches()
+
+    def _update_weight_caches(self):
+        """Pre-compute weight transformations to avoid runtime overhead."""
+        try:
+            # Cache transposed weight
+            self._weight_t_cache = self.weight.t().contiguous()
+
+            # Cache NZ format weight if needed
+            if self.use_nz_format and _NPU_AVAILABLE:
+                import torch_npu
+
+                self._weight_nz_cache = torch_npu.npu_format_cast(
+                    self._weight_t_cache, 29
+                )
+            else:
+                self._weight_nz_cache = None
+
+        except Exception as e:
+            logger.warning(f"Failed to cache weight transformations: {e}")
+            self._weight_t_cache = None
+            self._weight_nz_cache = None
+
     def forward(self, input_: torch.Tensor):
         """Forward pass using catcoc_matmul_allreduce when available."""
         # Get global shmem address (only once per forward call)
         if self.shmem_addr is None:
             self.shmem_addr = get_npu_catcoc_shmem_addr()
 
-        # Handle input sharding
+        # Handle input sharding (optimize contiguous operations)
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            # Split input across TP ranks
+            # Split input across TP ranks - minimize copies
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size
             )
-            input_parallel = splitted_input[self.tp_rank].contiguous()
+            input_parallel = splitted_input[self.tp_rank]
+            # Only make contiguous if necessary
+            if not input_parallel.is_contiguous():
+                input_parallel = input_parallel.contiguous()
 
-        # Get shapes for output allocation
-        batch_size = (
-            input_parallel.shape[0]
-            if input_parallel.dim() == 2
-            else input_parallel.shape[:-1].numel()
-        )
+        # Optimize input reshaping
+        original_shape = input_parallel.shape
         if input_parallel.dim() > 2:
             input_parallel = input_parallel.view(-1, input_parallel.shape[-1])
+            # Avoid unnecessary contiguous call if view is sufficient
 
         output_shape = list(input_parallel.shape[:-1]) + [self.output_size]
 
@@ -173,6 +197,7 @@ class CatcocRowParallelLinear(LinearBase):
             and self.tp_size > 1
             and hasattr(torch.ops, "npu")
             and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
+            and self._weight_t_cache is not None
         ):
             try:
                 # Prepare output tensor
@@ -182,26 +207,32 @@ class CatcocRowParallelLinear(LinearBase):
                     device=input_parallel.device,
                 ).contiguous()
 
-                # Prepare weight for operation
-                weight_t = self.weight.t().contiguous()
-
-                if self.use_nz_format:
-                    # Convert weight to NZ format
-                    weight_nz = torch_npu.npu_format_cast(weight_t, 29)
+                # Use cached weights to avoid transpose/format conversion overhead
+                if self.use_nz_format and self._weight_nz_cache is not None:
+                    # Use cached NZ format weight
                     torch.ops.npu.catcoc_matmul_allreduce(
                         input_parallel,
-                        weight_nz,
+                        self._weight_nz_cache,
                         output,
                         self.shmem_addr,
                         self.team_id,
                         format_mode="NZ",
                     )
                 else:
+                    # Use cached transposed weight
                     torch.ops.npu.catcoc_matmul_allreduce(
-                        input_parallel, weight_t, output, self.shmem_addr, self.team_id
+                        input_parallel,
+                        self._weight_t_cache,
+                        output,
+                        self.shmem_addr,
+                        self.team_id,
                     )
 
                 torch.npu.synchronize()
+
+                # Restore original shape if needed
+                if len(original_shape) > 2:
+                    output = output.view(*original_shape[:-1], self.output_size)
 
                 # Handle bias
                 if self.bias is not None and not self.skip_bias_add:
@@ -216,13 +247,22 @@ class CatcocRowParallelLinear(LinearBase):
                 )
 
         # Fallback to standard approach
-        output = torch.matmul(input_parallel, self.weight.t())
+        if self._weight_t_cache is not None:
+            # Use cached transposed weight
+            output = torch.matmul(input_parallel, self._weight_t_cache)
+        else:
+            # Fallback with runtime transpose
+            output = torch.matmul(input_parallel, self.weight.t())
 
         # Manual allreduce if needed
         if self.tp_size > 1:
             from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
             output = tensor_model_parallel_all_reduce(output)
+
+        # Restore original shape if needed
+        if len(original_shape) > 2:
+            output = output.view(*original_shape[:-1], self.output_size)
 
         # Handle bias
         if self.bias is not None and not self.skip_bias_add:
