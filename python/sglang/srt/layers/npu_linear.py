@@ -166,107 +166,88 @@ class CatcocRowParallelLinear(LinearBase):
 
     def forward(self, input_: torch.Tensor):
         """Forward pass using catcoc_matmul_allreduce when available."""
-        # Get global shmem address (only once per forward call)
+        # Get global shmem address
         if self.shmem_addr is None:
             self.shmem_addr = get_npu_catcoc_shmem_addr()
 
-        # Handle input sharding (optimize contiguous operations)
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            # Split input across TP ranks - minimize copies
+        # Prepare input
+        if not self.input_is_parallel:
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size
             )
-            input_parallel = splitted_input[self.tp_rank]
-            # Only make contiguous if necessary
-            if not input_parallel.is_contiguous():
-                input_parallel = input_parallel.contiguous()
+            input_ = splitted_input[self.tp_rank]
 
-        # Optimize input reshaping
-        original_shape = input_parallel.shape
-        if input_parallel.dim() > 2:
-            input_parallel = input_parallel.view(-1, input_parallel.shape[-1])
-            # Avoid unnecessary contiguous call if view is sufficient
+        # Flatten input if needed
+        original_shape = input_.shape
+        if input_.dim() > 2:
+            input_ = input_.view(-1, input_.shape[-1])
 
-        output_shape = list(input_parallel.shape[:-1]) + [self.output_size]
+        # Try catcoc operation first
+        output = self._catcoc_forward(input_)
 
-        # Try to use catcoc operation
-        if (
+        # Fallback if catcoc failed
+        if output is None:
+            output = self._standard_forward(input_)
+
+        # Restore shape and add bias
+        if len(original_shape) > 2:
+            output = output.view(*original_shape[:-1], -1)
+
+        if self.bias is not None and not self.skip_bias_add:
+            output = output + self.bias
+
+        bias_out = self.bias if self.skip_bias_add else None
+        return output, bias_out
+
+    def _catcoc_forward(self, input_: torch.Tensor):
+        """Try catcoc operation, return None if failed."""
+        if not (
             self.shmem_addr is not None
             and self.tp_size > 1
             and hasattr(torch.ops, "npu")
             and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
             and self._weight_t_cache is not None
         ):
-            try:
-                # Prepare output tensor
-                output = torch.empty(
-                    output_shape,
-                    dtype=input_parallel.dtype,
-                    device=input_parallel.device,
-                ).contiguous()
+            return None
 
-                # Use cached weights to avoid transpose/format conversion overhead
-                if self.use_nz_format and self._weight_nz_cache is not None:
-                    # Use cached NZ format weight
-                    torch.ops.npu.catcoc_matmul_allreduce(
-                        input_parallel,
-                        self._weight_nz_cache,
-                        output,
-                        self.shmem_addr,
-                        self.team_id,
-                        format_mode="NZ",
-                    )
-                else:
-                    # Use cached transposed weight
-                    torch.ops.npu.catcoc_matmul_allreduce(
-                        input_parallel,
-                        self._weight_t_cache,
-                        output,
-                        self.shmem_addr,
-                        self.team_id,
-                    )
+        try:
+            output = torch.empty(
+                input_.shape[:-1] + (self.output_size,),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
 
-                torch.npu.synchronize()
-
-                # Restore original shape if needed
-                if len(original_shape) > 2:
-                    output = output.view(*original_shape[:-1], self.output_size)
-
-                # Handle bias
-                if self.bias is not None and not self.skip_bias_add:
-                    output = output + self.bias
-
-                bias_out = self.bias if self.skip_bias_add else None
-                return output, bias_out
-
-            except Exception as e:
-                logger.warning(
-                    f"Catcoc operation failed: {e}, falling back to standard approach"
+            if self.use_nz_format and self._weight_nz_cache is not None:
+                torch.ops.npu.catcoc_matmul_allreduce(
+                    input_,
+                    self._weight_nz_cache,
+                    output,
+                    self.shmem_addr,
+                    self.team_id,
+                    format_mode="NZ",
+                )
+            else:
+                torch.ops.npu.catcoc_matmul_allreduce(
+                    input_, self._weight_t_cache, output, self.shmem_addr, self.team_id
                 )
 
-        # Fallback to standard approach
-        if self._weight_t_cache is not None:
-            # Use cached transposed weight
-            output = torch.matmul(input_parallel, self._weight_t_cache)
-        else:
-            # Fallback with runtime transpose
-            output = torch.matmul(input_parallel, self.weight.t())
+            torch.npu.synchronize()
+            return output
 
-        # Manual allreduce if needed
+        except Exception as e:
+            logger.warning(f"Catcoc operation failed: {e}")
+            return None
+
+    def _standard_forward(self, input_: torch.Tensor):
+        """Standard matmul + allreduce fallback."""
+        if self._weight_t_cache is not None:
+            output = torch.matmul(input_, self._weight_t_cache)
+        else:
+            output = torch.matmul(input_, self.weight.t())
+
         if self.tp_size > 1:
             from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
             output = tensor_model_parallel_all_reduce(output)
 
-        # Restore original shape if needed
-        if len(original_shape) > 2:
-            output = output.view(*original_shape[:-1], self.output_size)
-
-        # Handle bias
-        if self.bias is not None and not self.skip_bias_add:
-            output = output + self.bias
-
-        bias_out = self.bias if self.skip_bias_add else None
-        return output, bias_out
+        return output
