@@ -105,9 +105,9 @@ class Qwen2MLP(nn.Module):
     def prepare_for_catcoc_matmul(self):
         """Prepare transposed weight for catcoc matmul operation."""
         if self.down_proj_weight_t is None:
-            self.down_proj_weight_t = self.down_proj.weight.data.permute(
-                1, 0
-            ).contiguous()
+            # Ensure optimal memory layout and avoid format pollution
+            weight = self.down_proj.weight.data
+            self.down_proj_weight_t = torch.transpose(weight, 0, 1).contiguous()
         return self.down_proj_weight_t
 
     def _should_use_catcoc_matmul(self, forward_batch: ForwardBatch) -> bool:
@@ -142,38 +142,39 @@ class Qwen2MLP(nn.Module):
 
             weight = self.prepare_for_catcoc_matmul()
 
-            # Prepare tensors
+            # Prepare input tensor - ensure contiguity without shape changes
             original_shape = x.shape
-            if x.dim() > 2:
-                x = x.view(-1, x.shape[-1])
+            input_2d = x.view(-1, x.shape[-1]) if x.dim() > 2 else x
+            if not input_2d.is_contiguous():
+                input_2d = input_2d.contiguous()
 
-            # Prepare output
+            # Pre-allocate output with optimal layout
             output = torch.empty(
-                x.shape[0], weight.shape[1], dtype=x.dtype, device=x.device
+                input_2d.shape[0], weight.shape[1], dtype=x.dtype, device=x.device
             ).contiguous()
 
-            # Use NZ format for better performance if enabled
+            # Disable NZ format by default to avoid format pollution
             use_nz_format = (
-                not os.environ.get("CATCOC_DISABLE_NZ", "false").lower() == "true"
+                os.environ.get("CATCOC_ENABLE_NZ", "false").lower() == "true"
             )
 
             if use_nz_format:
-                try:
-                    weight_nz = torch_npu.npu_format_cast(weight, 29)
+                # Isolate NZ format operations to avoid global impact
+                with torch.npu.device(x.device):
+                    weight_nz = torch_npu.npu_format_cast(weight.clone(), 29)
                     torch.ops.npu.catcoc_matmul_allreduce(
-                        x, weight_nz, output, shmem_addr, 0, format_mode="NZ"
-                    )
-                except Exception:
-                    # Fallback to standard format
-                    torch.ops.npu.catcoc_matmul_allreduce(
-                        x, weight, output, shmem_addr, 0
+                        input_2d, weight_nz, output, shmem_addr, 0, format_mode="NZ"
                     )
             else:
-                torch.ops.npu.catcoc_matmul_allreduce(x, weight, output, shmem_addr, 0)
+                # Use standard format - better compatibility with aclnnmatmul
+                torch.ops.npu.catcoc_matmul_allreduce(
+                    input_2d, weight, output, shmem_addr, 0
+                )
 
-            torch.npu.synchronize()
+            # Remove forced synchronization - let NPU manage async execution
+            # torch.npu.synchronize()  # Commented out to preserve async pipeline
 
-            # Restore original shape
+            # Restore original shape if needed
             if len(original_shape) > 2:
                 output = output.view(*original_shape[:-1], output.shape[-1])
 
