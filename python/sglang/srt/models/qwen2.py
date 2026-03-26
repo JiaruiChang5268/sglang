@@ -38,13 +38,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 
-# NPU-specific optimizations
-try:
-    from sglang.srt.layers.npu_linear import CatcocRowParallelLinear
-
-    _NPU_LINEAR_AVAILABLE = True
-except ImportError:
-    _NPU_LINEAR_AVAILABLE = False
+# NPU-specific functionality check
+_NPU_AVAILABLE = torch.npu.is_available()
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -92,98 +87,65 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-
-        # Use NPU-optimized layer if available and running on NPU
-        use_npu_optimized = self._should_use_npu_optimized(quant_config)
-
-        if use_npu_optimized:
-            self.down_proj = CatcocRowParallelLinear(
-                intermediate_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("down_proj", prefix),
-                use_nz_format=True,  # Enable NZ format for better performance
-            )
-        else:
-            self.down_proj = RowParallelLinear(
-                intermediate_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("down_proj", prefix),
-            )
-
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.down_proj_weight_t = None
 
-    def _should_use_npu_optimized(
-        self, quant_config: Optional[QuantizationConfig] = None
-    ) -> bool:
-        """Check if NPU-optimized layer should be used."""
-        if not _NPU_LINEAR_AVAILABLE:
-            return False
+    def prepare_for_catcoc_matmul(self):
+        """Prepare transposed weight for catcoc matmul operation."""
+        if self.down_proj_weight_t is None:
+            self.down_proj_weight_t = self.down_proj.weight.data.permute(
+                1, 0
+            ).contiguous()
+        return self.down_proj_weight_t
 
-        # Don't use if quantization is enabled (not supported yet)
-        if quant_config is not None:
-            return False
-
-        try:
-            # Check if current device is NPU and multi-device setup
-            current_device = torch.device("npu" if torch.npu.is_available() else "cpu")
-            tp_size = get_tensor_model_parallel_world_size()
-
-            # Enable NPU optimization for multi-device NPU setup
-            return (
-                torch.npu.is_available()
-                and tp_size > 1
-                and hasattr(torch.ops, "npu")
-                and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
-            )
-        except (ImportError, AttributeError):
-            return False
-
-    def _should_use_catcoc_matmul(self) -> bool:
+    def _should_use_catcoc_matmul(self, forward_batch: ForwardBatch) -> bool:
         """Check if catcoc matmul allreduce should be used."""
+        if not _NPU_AVAILABLE:
+            return False
+
         try:
             tp_size = get_tensor_model_parallel_world_size()
             shmem_addr = get_npu_catcoc_shmem_addr()
 
-            # Enable catcoc optimization for multi-device NPU setup with initialized shmem
+            # Enable catcoc optimization for decode mode in multi-device NPU setup
             return (
-                torch.npu.is_available()
+                forward_batch.forward_mode.is_decode()
                 and tp_size > 1
                 and shmem_addr is not None
                 and hasattr(torch.ops, "npu")
                 and hasattr(torch.ops.npu, "catcoc_matmul_allreduce")
-                and hasattr(
-                    self.down_proj, "weight"
-                )  # Ensure standard RowParallelLinear
             )
         except (ImportError, AttributeError):
             return False
 
     def _catcoc_matmul_allreduce(self, x: torch.Tensor) -> torch.Tensor:
-        """Perform catcoc matmul allreduce operation using global shmem."""
+        """Perform catcoc matmul allreduce operation."""
         try:
             import torch_npu
 
-            # Get global shmem address
+            # Get global shmem address and prepared weight
             shmem_addr = get_npu_catcoc_shmem_addr()
             if shmem_addr is None:
                 raise RuntimeError("NPU catcoc shmem not initialized")
+
+            weight = self.prepare_for_catcoc_matmul()
 
             # Prepare tensors
             original_shape = x.shape
             if x.dim() > 2:
                 x = x.view(-1, x.shape[-1])
-
-            # Get weight from down_proj
-            weight = self.down_proj.weight.t().contiguous()
 
             # Prepare output
             output = torch.empty(
@@ -225,17 +187,14 @@ class Qwen2MLP(nn.Module):
             x, _ = self.down_proj(x)
             return x
 
-    def forward(self, x):
+    def forward(self, x, forward_batch: ForwardBatch):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
 
-        # Check if NPU catcoc optimization should be used
-        use_catcoc_matmul = self._should_use_catcoc_matmul()
-
-        if use_catcoc_matmul:
+        if self._should_use_catcoc_matmul(forward_batch):
             x = self._catcoc_matmul_allreduce(x)
         else:
             x, _ = self.down_proj(x)
@@ -395,7 +354,7 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
         return hidden_states, residual
 
 
