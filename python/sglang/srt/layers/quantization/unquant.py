@@ -130,6 +130,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if _is_npu:
+            layer.weight.data = layer.weight.data.permute(1, 0).contiguous()
 
     def apply(
         self,
@@ -153,6 +155,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
+        elif _is_npu:
+            out = torch.matmul(x, layer.weight)
+            if bias is not None:
+                out += bias
+            return out
 
         return F.linear(x, layer.weight, bias)
 
