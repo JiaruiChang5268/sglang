@@ -336,6 +336,11 @@ class Envs:
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
+    SGLANG_NPU_PROFILING = EnvBool(False)
+    SGLANG_NPU_PROFILING_BS = EnvInt(8)
+    SGLANG_NPU_PROFILING_STAGE = EnvStr("decode")
+    SGLANG_NPU_PROFILING_STEP = EnvInt(10)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
