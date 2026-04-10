@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import os
 import re
 from typing import Iterable, Optional, Set, Tuple
 
@@ -23,6 +24,20 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+
+# Debug switch for precision comparison
+DEBUG_PRECISION = os.getenv("SGLANG_DEBUG_PRECISION", "0").lower() in [
+    "1",
+    "true",
+    "yes",
+]
+
+
+def debug_print(*args, **kwargs):
+    """Print debug info only when debug switch is enabled"""
+    if DEBUG_PRECISION:
+        print(*args, **kwargs)
+
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -337,7 +352,22 @@ class Gemma4Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        # Debug: Q before norm
+        device_type = (
+            "NPU"
+            if q.device.type == "npu"
+            else "GPU" if q.device.type == "cuda" else "CPU"
+        )
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Q before norm: dtype={q.dtype}, shape={q.shape}, mean={q.float().mean().item():.6f}, max={q.float().max().item():.6f}, min={q.float().min().item():.6f}"
+        )
+
         q = self.q_norm(q)
+
+        # Debug: Q after norm
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Q after norm: dtype={q.dtype}, shape={q.shape}, mean={q.float().mean().item():.6f}, max={q.float().max().item():.6f}, min={q.float().min().item():.6f}"
+        )
         q = q.flatten(-2, -1)
 
         # Check if we should use shared KV cache
@@ -348,10 +378,26 @@ class Gemma4Attention(nn.Module):
             v = None
         else:
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            # Debug: K before norm
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} K before norm: dtype={k.dtype}, shape={k.shape}, mean={k.float().mean().item():.6f}, max={k.float().max().item():.6f}"
+            )
             k = self.k_norm(k)
+            # Debug: K after norm
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} K after norm: dtype={k.dtype}, shape={k.shape}, mean={k.float().mean().item():.6f}, max={k.float().max().item():.6f}"
+            )
 
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            # Debug: V before norm
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} V before norm: dtype={v.dtype}, shape={v.shape}, mean={v.float().mean().item():.6f}, max={v.float().max().item():.6f}"
+            )
             v = self.v_norm(v)
+            # Debug: V after norm
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} V after norm: dtype={v.dtype}, shape={v.shape}, mean={v.float().mean().item():.6f}, max={v.float().max().item():.6f}"
+            )
 
         # Apply rotary embedding
         if k is not None:
@@ -364,6 +410,19 @@ class Gemma4Attention(nn.Module):
             q, _ = self.rotary_emb(positions, q, dummy_k)
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
+
+        # Debug: Inputs to attention
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Attn input Q: dtype={q.dtype}, shape={q.shape}, mean={q.float().mean().item():.6f}"
+        )
+        if k is not None:
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} Attn input K: dtype={k.dtype}, shape={k.shape}, mean={k.float().mean().item():.6f}"
+            )
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} Attn input V: dtype={v.dtype}, shape={v.shape}, mean={v.float().mean().item():.6f}"
+            )
+
         attn_output = self.attn(
             q,
             k,
@@ -371,9 +430,20 @@ class Gemma4Attention(nn.Module):
             forward_batch=forward_batch,
             save_kv_cache=not self.is_kv_shared_layer,
         )
+
+        # Debug: Attention output
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Attn output: dtype={attn_output.dtype}, shape={attn_output.shape}, mean={attn_output.float().mean().item():.6f}, max={attn_output.float().max().item():.6f}, min={attn_output.float().min().item():.6f}"
+        )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
+
         output, _ = self.o_proj(attn_output)
+
+        # Debug: Final attention output
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Final attn output: dtype={output.dtype}, shape={output.shape}, mean={output.float().mean().item():.6f}, max={output.float().max().item():.6f}, min={output.float().min().item():.6f}"
+        )
 
         return output
 
@@ -525,13 +595,34 @@ class Gemma4DecoderLayer(nn.Module):
         residual = hidden_states
 
         # Apply input layernorm
+        device_type = (
+            "NPU"
+            if hidden_states.device.type == "npu"
+            else "GPU" if hidden_states.device.type == "cuda" else "CPU"
+        )
+        debug_print(f"\n[{device_type}] === Layer {self.layer_id} Start ===")
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Input: dtype={hidden_states.dtype}, shape={hidden_states.shape}, mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+        )
+
         hidden_states = self.input_layernorm(hidden_states)
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} After input_layernorm: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+        )
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} After self_attn: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+        )
+
         hidden_states = self.post_attention_layernorm(hidden_states)
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} After post_attention_layernorm: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+        )
 
         if self.enable_moe_block:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
@@ -560,7 +651,13 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} Before MLP: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+            )
             hidden_states = self.mlp(hidden_states)
+            debug_print(
+                f"[{device_type}] Layer {self.layer_id} After MLP: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+            )
 
         if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
@@ -587,6 +684,11 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
+
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Final output: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}, min={hidden_states.float().min().item():.6f}"
+        )
+        debug_print(f"[{device_type}] === Layer {self.layer_id} End ===\n")
         return hidden_states, None
 
 
