@@ -23,7 +23,7 @@ def npu_wrapper_preprocess(func):
         images: list["torch.Tensor"],
         do_resize: bool,
         size: SizeDict,
-        interpolation: Optional["tvF.InterpolationMode"],
+        resample: Optional["tvF.InterpolationMode"],
         do_rescale: bool,
         rescale_factor: float,
         do_normalize: bool,
@@ -54,7 +54,7 @@ def npu_wrapper_preprocess(func):
                 stacked_images = self.resize(
                     image=stacked_images,
                     size=SizeDict(height=resized_height, width=resized_width),
-                    interpolation=interpolation,
+                    interpolation=resample,
                 )
             resized_images_grouped[shape] = stacked_images
         resized_images = reorder_images(resized_images_grouped, grouped_images_index)
@@ -146,7 +146,7 @@ def npu_apply_qwen_image_preprocess_patch():
     if _npu_preprocess_patched:
         return
     apply_module_patch(
-        "transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast",
+        "transformers.models.qwen2_vl.image_processing_qwen2_vl.Qwen2VLImageProcessor",
         "_preprocess",
         [npu_wrapper_preprocess],
     )
