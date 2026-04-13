@@ -235,6 +235,20 @@ class Gemma4Attention(nn.Module):
             config.sliding_window if layer_type == "sliding_attention" else None
         )
 
+        # Add sinks parameter for sliding_attention layers
+        if layer_type == "sliding_attention":
+            # Choose dtype of sinks based on attention backend
+            attn_backend = get_global_server_args().attention_backend
+            sinks_dtype = (
+                torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+            )
+            self.sinks = nn.Parameter(
+                torch.empty(config.num_attention_heads // tp_size, dtype=sinks_dtype),
+                requires_grad=False,
+            )
+        else:
+            self.sinks = None
+
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -429,6 +443,7 @@ class Gemma4Attention(nn.Module):
             v,
             forward_batch=forward_batch,
             save_kv_cache=not self.is_kv_shared_layer,
+            sinks=self.sinks if hasattr(self, "sinks") else None,
         )
 
         # Debug: Attention output
