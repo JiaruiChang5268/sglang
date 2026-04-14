@@ -707,6 +707,38 @@ class Gemma4RMSNorm(MultiPlatformOp):
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        needs_reshape = x.dim() != 2
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+
+        if self.with_scale and self.scale_shift == 1.0:
+            # Use NPU gemma_rmsnorm for scale_shift=1.0: norm(x) * (1 + weight)
+            out, _ = torch_npu.npu_gemma_rms_norm(x, self.weight.data, self.eps)
+        elif self.with_scale and self.scale_shift == 0.0:
+            # For scale_shift=0.0: norm(x) * weight
+            # Since npu_gemma_rms_norm computes norm(x) * (1 + w), we need w such that (1 + w) = weight
+            # So w = weight - 1
+            adjusted_weight = self.weight.data - 1.0
+            out, _ = torch_npu.npu_gemma_rms_norm(x, adjusted_weight, self.eps)
+        elif not self.with_scale:
+            # with_scale=False: norm(x) only
+            # We need norm(x) * 1 = norm(x) * (1 + 0), so weight should be zeros
+            zero_weight = torch.zeros_like(self.weight.data)
+            out, _ = torch_npu.npu_gemma_rms_norm(x, zero_weight, self.eps)
+        else:
+            # Uncommon scale_shift values: fallback to native for safety
+            if needs_reshape:
+                x = x.reshape(original_shape)
+            return self.forward_native(x)
+
+        if needs_reshape:
+            out = out.reshape(original_shape)
+        return out
+
 
 class RMSNormWithoutScale(MultiPlatformOp):
     def __init__(self, hidden_size: int, eps=1e-6):
