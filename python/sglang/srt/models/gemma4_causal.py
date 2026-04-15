@@ -25,6 +25,8 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
 # Debug switch for precision comparison
 DEBUG_PRECISION = os.getenv("SGLANG_DEBUG_PRECISION", "0").lower() in [
     "1",
@@ -232,7 +234,9 @@ class Gemma4Attention(nn.Module):
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
+            get_attention_sliding_window_size(config)
+            if layer_type == "sliding_attention"
+            else -1
         )
 
         # Add sinks parameter for sliding_attention layers
@@ -344,7 +348,7 @@ class Gemma4Attention(nn.Module):
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
-            1,  # scaling factor
+            1,
             num_kv_heads=self.num_kv_heads,
             layer_id=(
                 self.kv_shared_layer_index if self.is_kv_shared_layer else self.layer_id
@@ -452,6 +456,11 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
+
+        # Debug: Before o_proj
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Before o_proj: mean={attn_output.float().mean().item():.6f}, max={attn_output.float().max().item():.6f}"
+        )
 
         output, _ = self.o_proj(attn_output)
 
@@ -623,6 +632,11 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         debug_print(
             f"[{device_type}] Layer {self.layer_id} After input_layernorm: mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
+        )
+
+        # Debug: Before attention
+        debug_print(
+            f"[{device_type}] Layer {self.layer_id} Before self_attn (qkv input): mean={hidden_states.float().mean().item():.6f}, max={hidden_states.float().max().item():.6f}"
         )
 
         hidden_states = self.self_attn(
@@ -1093,11 +1107,17 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         continue
                     if name not in params_dict:
                         continue
+
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+
+                    if "sinks" in name:
+                        start = get_attention_tp_rank() * param.numel()
+                        param.data.copy_(loaded_weight[start : start + param.numel()])
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
