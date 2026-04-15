@@ -916,12 +916,26 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None:
+            # Check if this layer needs sliding window attention (like GPU backend)
+            is_sliding_window_layer = (
+                layer.sliding_window_size is not None and layer.sliding_window_size > -1
+            )
+
+            if sinks is not None or is_sliding_window_layer:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
-                if self.is_hybrid_swa and layer.sliding_window_size != -1:
+                if self.is_hybrid_swa and is_sliding_window_layer:
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
+
+                # For Gemma4-style sliding attention without explicit sinks,
+                # create dummy sinks (zeros) if needed
+                if sinks is None and is_sliding_window_layer:
+                    # Create dummy sinks for Gemma4-style sliding attention
+                    sinks = torch.zeros(
+                        layer.tp_q_head_num, dtype=q.dtype, device=q.device
+                    )
+
                 attn_out = attention_sinks_prefill_triton(
                     q,
                     k_cache,
@@ -1599,15 +1613,27 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
-        if sinks is not None:
+        # Check if this layer needs sliding window attention (like GPU backend)
+        is_sliding_window_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+
+        if sinks is not None or is_sliding_window_layer:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             # Use SWA block tables if hybrid SWA is enabled for this layer
-            if self.is_hybrid_swa and layer.sliding_window_size != -1:
+            if self.is_hybrid_swa and is_sliding_window_layer:
                 block_tables = self.forward_metadata.block_tables_swa
             else:
                 block_tables = self.forward_metadata.block_tables
+
+            # For Gemma4-style sliding attention without explicit sinks,
+            # create dummy sinks (zeros) if needed
+            if sinks is None and is_sliding_window_layer:
+                # Create dummy sinks for Gemma4-style sliding attention
+                sinks = torch.zeros(layer.tp_q_head_num, dtype=q.dtype, device=q.device)
+
             attn_out = attention_sinks_triton(
                 q,
                 k_cache,
@@ -1816,12 +1842,26 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None:
+            # Check if this layer needs sliding window attention (like GPU backend)
+            is_sliding_window_layer = (
+                layer.sliding_window_size is not None and layer.sliding_window_size > -1
+            )
+
+            if sinks is not None or is_sliding_window_layer:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
-                if self.is_hybrid_swa and layer.sliding_window_size != -1:
+                if self.is_hybrid_swa and is_sliding_window_layer:
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
+
+                # For Gemma4-style sliding attention without explicit sinks,
+                # create dummy sinks (zeros) if needed
+                if sinks is None and is_sliding_window_layer:
+                    # Create dummy sinks for Gemma4-style sliding attention
+                    sinks = torch.zeros(
+                        layer.tp_q_head_num, dtype=q.dtype, device=q.device
+                    )
+
                 attn_out = attention_sinks_triton(
                     q,
                     k_cache,
