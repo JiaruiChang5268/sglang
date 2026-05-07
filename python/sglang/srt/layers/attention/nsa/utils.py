@@ -157,10 +157,7 @@ class NSAContextParallelMetadata:
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
-        cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        cur_cp_seq_len = ceil_div(seq_len, cp_size)
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -181,10 +178,6 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -198,11 +191,6 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
         return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
@@ -366,11 +354,17 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     if is_nsa_prefill_cp_round_robin_split():
+        total_len = sum(forward_batch.extend_seq_lens_cpu)
+        max_len = ceil_div(total_len, cp_size)
+        pad_len = max_len - input_tensor.shape[0]
+        if pad_len > 0:
+            padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_len]
+            input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+                (max_len * cp_size, *input_tensor.shape[1:]),
             )
         attn_cp_all_gather_into_tensor(
             output_tensor,
@@ -382,7 +376,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             .transpose(0, 1)
             .reshape(out_shape)
         )
-        return output_tensor
+        return output_tensor[:total_len]
 
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(

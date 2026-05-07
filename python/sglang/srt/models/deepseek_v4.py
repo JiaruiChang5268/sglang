@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
@@ -181,6 +182,12 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _current_accelerator_stream():
+    if _is_npu:
+        return torch.npu.current_stream()
+    return torch.cuda.current_stream()
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -1497,12 +1504,10 @@ class DeepseekV4AttentionMLA(nn.Module):
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        self.attn_tp_size = attn_tp_size
         self.use_nsa = is_deepseek_nsa(config)
         assert (
             self.o_groups >= attn_tp_size and self.o_groups % attn_tp_size == 0
         ), f"{self.o_groups=} and {attn_tp_size=} is not supported"
-        self.local_o_groups = self.o_groups // attn_tp_size
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
@@ -1511,6 +1516,8 @@ class DeepseekV4AttentionMLA(nn.Module):
             attn_tp_rank = 0
             attn_tp_size = 1
             self.cp_size = get_attention_tp_size()
+        self.attn_tp_size = attn_tp_size
+        self.local_o_groups = self.o_groups // attn_tp_size
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -1525,7 +1532,12 @@ class DeepseekV4AttentionMLA(nn.Module):
         self.attn_sink = nn.Parameter(
             torch.empty(self.num_local_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.attn_sink, {"weight_loader": sharded_weight_loader(0)})
+        attn_sink_weight_loader = (
+            default_weight_loader
+            if self.nsa_enable_prefill_cp and self.use_nsa
+            else sharded_weight_loader(0)
+        )
+        set_weight_attrs(self.attn_sink, {"weight_loader": attn_sink_weight_loader})
 
         self.wq_a = ReplicatedLinear(
             self.hidden_size,
@@ -1862,9 +1874,12 @@ class DeepseekV4AttentionMLA(nn.Module):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
+        use_pa_decode = get_bool_env_var("USE_PA_DECODE") and not (
+            _is_npu and self.nsa_enable_prefill_cp
+        )
         need_compute_topk_idxs = (
             is_prefill and not get_bool_env_var("USE_PA_PREFILL")
-        ) or (not get_bool_env_var("USE_PA_DECODE") and not is_prefill)
+        ) or (not use_pa_decode and not is_prefill)
         if need_compute_topk_idxs:
             topk_idxs = get_window_topk_idxs(
                 num_tokens, self.window_size, forward_batch.seq_lens, is_prefill
@@ -1898,7 +1913,7 @@ class DeepseekV4AttentionMLA(nn.Module):
                         ],
                         dim=0,
                     )
-                if not is_prefill and not get_bool_env_var("USE_PA_DECODE"):
+                if not is_prefill and not use_pa_decode:
                     offset = self.window_size
                 if offset is not None:
                     compress_topk_idxs = torch.where(
@@ -1924,7 +1939,7 @@ class DeepseekV4AttentionMLA(nn.Module):
                 else:
                     topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             else:
-                if get_bool_env_var("USE_PA_DECODE"):
+                if use_pa_decode:
                     topk_idxs = compress_topk_idxs
                 else:
                     topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
@@ -2047,7 +2062,7 @@ class DeepseekV4AttentionMLA(nn.Module):
             latent_cache.contiguous(),
             self.cp_size,
             forward_batch,
-            torch.cuda.current_stream(),
+            _current_accelerator_stream(),
         )
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
@@ -3140,7 +3155,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                _current_accelerator_stream(),
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -3303,6 +3318,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
+            assert (not _is_npu) or is_nsa_prefill_cp_round_robin_split(), (
+                "DeepSeek V4 NPU CP currently supports only "
+                "nsa_prefill_cp_mode=round-robin-split."
+            )
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
                     len(input_ids),

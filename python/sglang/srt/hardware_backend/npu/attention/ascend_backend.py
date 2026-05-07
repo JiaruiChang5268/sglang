@@ -469,7 +469,7 @@ class AscendAttnBackend(AttentionBackend):
             "layout_q": "TND",  # "BSND" , "TND"
             "layout_kv": "PA_ND",  # "PA_ND"
         }
-        tp_size = get_attention_tp_size()
+        tp_size = 1 if self.is_dsv4 and is_nsa_enable_prefill_cp() else get_attention_tp_size()
         q_head_num = self.config.get_num_attention_heads(tp_size)
         kv_head_num = self.config.get_total_num_kv_heads()
         c1a_metadata_kwargs = {
@@ -913,7 +913,20 @@ class AscendAttnBackend(AttentionBackend):
                         // self.page_size
                     )
 
-        if self.is_dsv4:
+        need_dsv4_kernel_metadata = self.is_dsv4 and (
+            (
+                forward_batch.forward_mode.is_decode()
+                and get_bool_env_var("USE_PA_DECODE")
+                and not is_nsa_enable_prefill_cp()
+            )
+            or (
+                forward_batch.forward_mode.is_prefill()
+                and get_bool_env_var("USE_PA_PREFILL")
+            )
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        )
+        if need_dsv4_kernel_metadata:
             self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
                 forward_batch.batch_size,
                 self.forward_metadata,
@@ -1668,7 +1681,9 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 o = q.new_empty((q.shape[0], q.shape[1], layer.head_dim))
 
-                use_pa_decode = get_bool_env_var("USE_PA_DECODE")
+                use_pa_decode = get_bool_env_var(
+                    "USE_PA_DECODE"
+                ) and not is_nsa_enable_prefill_cp()
                 if use_pa_decode:
                     cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                         layer.layer_id, False

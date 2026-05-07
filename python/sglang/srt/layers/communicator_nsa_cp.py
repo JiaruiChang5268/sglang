@@ -146,9 +146,13 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         context: CommunicateContext,
         *,
         residual_input_mode,
+        skip_layernorm=False,
     ):
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+        if not skip_layernorm and hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = layernorm(hidden_states, residual)
+            else:
+                hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):

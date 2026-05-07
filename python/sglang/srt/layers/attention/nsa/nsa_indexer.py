@@ -58,6 +58,9 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
+    is_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_q_seqs_cpu,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import (
@@ -1875,11 +1878,8 @@ class Indexer(MultiPlatformOp):
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-        if (
-            is_prefill
-            and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
-        ):
+        use_prefill_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+        if is_prefill and use_prefill_cp:
             k = cp_all_gather_rerange_output(
                 k.contiguous().view(-1, self.head_dim),
                 self.cp_size,
@@ -1891,7 +1891,7 @@ class Indexer(MultiPlatformOp):
             layer_id, forward_batch.out_cache_loc, k
         )
         if is_prefill:
-            if self.nsa_enable_prefill_cp and forward_batch.nsa_cp_metadata is not None:
+            if use_prefill_cp and is_nsa_prefill_cp_in_seq_split():
                 forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
                     forward_batch.nsa_cp_metadata.actual_seq_q_prev_tensor,
                     forward_batch.nsa_cp_metadata.actual_seq_q_next_tensor,
@@ -1906,9 +1906,29 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv = (
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv
                 )
+            elif use_prefill_cp and is_nsa_prefill_cp_round_robin_split():
+                local_q_lens_cpu, local_bs_idx_cpu = (
+                    nsa_cp_round_robin_split_q_seqs_cpu(
+                        forward_batch.extend_seq_lens_cpu
+                    )
+                )
+                actual_seq_lengths_q = torch.tensor(
+                    local_q_lens_cpu,
+                    dtype=torch.int32,
+                    device=k.device,
+                ).cumsum(dim=0)
+                local_bs_idx = torch.tensor(
+                    local_bs_idx_cpu,
+                    dtype=torch.long,
+                    device=forward_batch.attn_backend.forward_metadata.block_tables.device,
+                )
+                actual_seq_lengths_kv = forward_batch.seq_lens.index_select(
+                    0, local_bs_idx.to(forward_batch.seq_lens.device)
+                )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
+                local_bs_idx = None
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -1936,6 +1956,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_q = (
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
                 )
+            local_bs_idx = None
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
@@ -1950,11 +1971,7 @@ class Indexer(MultiPlatformOp):
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
-        if (
-            is_prefill
-            and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
-        ):
+        if is_prefill and use_prefill_cp and is_nsa_prefill_cp_in_seq_split():
             block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -1971,6 +1988,8 @@ class Indexer(MultiPlatformOp):
                 if is_prefill
                 else block_table
             )
+            if is_prefill and local_bs_idx is not None:
+                block_table = block_table.index_select(0, local_bs_idx)
 
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
@@ -2047,11 +2066,40 @@ class Indexer(MultiPlatformOp):
         )  # [t, n_local_heads]
 
         # # compressor path, rotate=True 内部对kv做hadamard变换
-        self.compressor(x, positions, forward_batch)  # 放c4 index compress + state
+        use_prefill_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+        if use_prefill_cp:
+            assert is_nsa_prefill_cp_round_robin_split(), (
+                "NPU DeepSeek V4 CP only supports round-robin-split in the DSV4 "
+                "indexer/compressor path."
+            )
+            compressor_x = cp_all_gather_rerange_output(
+                x.contiguous(),
+                self.cp_size,
+                forward_batch,
+                torch.npu.current_stream(),
+            )
+            compressor_positions = cp_all_gather_rerange_output(
+                positions.contiguous().unsqueeze(-1),
+                self.cp_size,
+                forward_batch,
+                torch.npu.current_stream(),
+            ).squeeze(-1)
+        else:
+            compressor_x = x
+            compressor_positions = positions
+        self.compressor(compressor_x, compressor_positions, forward_batch)
 
         seqlens_cpu = forward_batch.seq_lens_cpu
 
-        if self.li_kv_dtype == "int8":
+        use_fused_li = (
+            self.li_kv_dtype == "int8"
+            and forward_batch.attn_backend.forward_metadata.kernel_metadata is not None
+        )
+        if use_fused_li:
+            assert not use_prefill_cp, (
+                "NPU DeepSeek V4 round-robin CP is not wired for the int8 fused "
+                "lightning indexer metadata path yet."
+            )
             li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                 layer_id, True
             )
@@ -2069,6 +2117,14 @@ class Indexer(MultiPlatformOp):
 
         page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
         topk_idxs = []
+        if use_prefill_cp:
+            local_seq_lens_cpu, local_bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(
+                forward_batch.extend_seq_lens_cpu
+            )
+            local_seq_lens = dict(zip(local_bs_idx_cpu, local_seq_lens_cpu))
+        else:
+            local_seq_lens = None
+        local_q_offset = 0
         for i, start in enumerate(end_pos):
             kv_indices = get_kv_indices(
                 forward_batch,
@@ -2078,14 +2134,35 @@ class Indexer(MultiPlatformOp):
                 seqlens_cpu[i] // ratio,
             )
             if is_prefill:
-                start = 0 if i == 0 else end_pos[i - 1]
-                end = end_pos[i]
+                if use_prefill_cp:
+                    local_len = int(local_seq_lens.get(i, 0))
+                    if local_len == 0:
+                        continue
+                    start = local_q_offset
+                    end = local_q_offset + local_len
+                    local_q_offset = end
+                    positions_for_mask = positions[start:end].to(x.device)
+                else:
+                    start = 0 if i == 0 else end_pos[i - 1]
+                    end = end_pos[i]
+                    positions_for_mask = torch.arange(
+                        0, seqlens_cpu[i], device=x.device
+                    )
                 # q [start:end,...] [s,64,128]
                 # kv_cache [sep_len[i]//4,128]
                 # weights [start:end,...] [s, 64]
                 kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(  # 使用c4 index compress blocktable; int8量化
                     layer_id, True, kv_indices
                 )
+                if self.li_kv_dtype == "int8":
+                    kv_cache_scale = (
+                        forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                            layer_id, True, kv_indices
+                        )
+                    )
+                    kv_cache_value = kv_cache_value.to(q.dtype) * kv_cache_scale.to(
+                        q.dtype
+                    )
                 index_score = torch.einsum(
                     "shd,td->sht",
                     q[start:end, ...],
@@ -2101,10 +2178,9 @@ class Indexer(MultiPlatformOp):
 
                 mask = (
                     torch.arange(seqlens_cpu[i] // ratio, device=x.device).repeat(
-                        seqlens_cpu[i], 1
+                        end - start, 1
                     )
-                    >= torch.arange(1, seqlens_cpu[i] + 1, device=x.device).unsqueeze(1)
-                    // ratio
+                    >= positions_for_mask.add(1).unsqueeze(1) // ratio
                 )  # [s, seq_len[i]//4]
                 index_score += torch.where(
                     mask, float("-inf"), 0
@@ -2114,14 +2190,22 @@ class Indexer(MultiPlatformOp):
                 )[1]
                 mask = (
                     topk_idx
-                    >= torch.arange(1, seqlens_cpu[i] + 1, device=x.device).unsqueeze(1)
-                    // ratio
+                    >= positions_for_mask.add(1).unsqueeze(1) // ratio
                 )
                 topk_idx = torch.where(mask, -1, topk_idx)
             else:
                 kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(
                     layer_id, True, kv_indices
                 )
+                if self.li_kv_dtype == "int8":
+                    kv_cache_scale = (
+                        forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                            layer_id, True, kv_indices
+                        )
+                    )
+                    kv_cache_value = kv_cache_value.to(q.dtype) * kv_cache_scale.to(
+                        q.dtype
+                    )
                 index_score = torch.einsum(
                     "shd,td->sht",
                     q[i : i + 1, ...],  # [1, 64, seqlens[i]//4]
