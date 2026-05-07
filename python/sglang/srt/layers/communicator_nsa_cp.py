@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
+    cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
@@ -32,9 +33,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
-    attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -157,13 +156,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
-            hidden_states, local_hidden_states = (
-                get_local_dp_buffer(),
+            hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
-            )
-            attn_cp_all_gather_into_tensor(
-                hidden_states,
-                local_hidden_states,
+                context.attn_cp_size,
+                forward_batch,
+                torch.npu.current_stream(),
             )
         return hidden_states, residual
 

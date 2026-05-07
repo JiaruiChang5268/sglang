@@ -2093,13 +2093,10 @@ class Indexer(MultiPlatformOp):
 
         use_fused_li = (
             self.li_kv_dtype == "int8"
+            and not use_prefill_cp
             and forward_batch.attn_backend.forward_metadata.kernel_metadata is not None
         )
         if use_fused_li:
-            assert not use_prefill_cp, (
-                "NPU DeepSeek V4 round-robin CP is not wired for the int8 fused "
-                "lightning indexer metadata path yet."
-            )
             li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                 layer_id, True
             )

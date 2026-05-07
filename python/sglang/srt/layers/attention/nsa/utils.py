@@ -355,7 +355,15 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     if is_nsa_prefill_cp_round_robin_split():
         total_len = sum(forward_batch.extend_seq_lens_cpu)
+        if input_tensor.shape[0] == total_len:
+            return input_tensor
         max_len = ceil_div(total_len, cp_size)
+        if input_tensor.shape[0] > max_len:
+            raise RuntimeError(
+                "Invalid round-robin CP shard length: "
+                f"local_len={input_tensor.shape[0]}, max_rank_len={max_len}, "
+                f"total_len={total_len}, cp_size={cp_size}."
+            )
         pad_len = max_len - input_tensor.shape[0]
         if pad_len > 0:
             padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_len]
