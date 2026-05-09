@@ -61,6 +61,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_prefill_cp_round_robin_split,
     nsa_cp_round_robin_split_q_seqs_cpu,
     nsa_use_prefill_cp,
+    use_nsa_dsv4_pa_prefill,
 )
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import (
@@ -391,7 +392,7 @@ class Compressor(nn.Module):
         if len(kv_out_list) > 0:
             kv_to_be_cached = torch.cat(kv_out_list, dim=0)
             self.compressor_epilog(kv_to_be_cached, forward_batch)
-        if is_prefill and not get_bool_env_var("USE_PA_PREFILL"):
+        if is_prefill and not use_nsa_dsv4_pa_prefill():
             return kv_out_list
         else:
             return None
@@ -512,7 +513,7 @@ class Compressor(nn.Module):
             self.compressor_epilog(kv, forward_batch)
 
         # split kv tensor to list
-        if is_prefill and not get_bool_env_var("USE_PA_PREFILL"):
+        if is_prefill and not use_nsa_dsv4_pa_prefill():
             dim = kv.shape[-1]
             kv_out_list = [kv.new_empty((0, dim)) for _ in range(batch_size)]
             offset = 0
@@ -1925,6 +1926,8 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv = forward_batch.seq_lens.index_select(
                     0, local_bs_idx.to(forward_batch.seq_lens.device)
                 )
+                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = actual_seq_lengths_q
+                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = actual_seq_lengths_kv
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)

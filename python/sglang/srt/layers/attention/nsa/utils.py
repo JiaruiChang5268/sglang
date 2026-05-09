@@ -21,6 +21,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
@@ -33,6 +34,16 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 
 def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
+
+
+def use_nsa_dsv4_pa_prefill():
+    # Keep DSV4 model, compressor, and NPU backend on the same effective gate.
+    return get_bool_env_var("USE_PA_PREFILL")
+
+
+def use_nsa_dsv4_pa_decode():
+    # PA decode is compatible with prefill CP once DSV4 attention weights are replicated.
+    return get_bool_env_var("USE_PA_DECODE")
 
 
 def is_nsa_prefill_cp_in_seq_split():

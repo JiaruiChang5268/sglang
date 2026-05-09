@@ -71,6 +71,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
+    use_nsa_dsv4_pa_decode,
+    use_nsa_dsv4_pa_prefill,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import (
@@ -1874,12 +1876,11 @@ class DeepseekV4AttentionMLA(nn.Module):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
-        use_pa_decode = get_bool_env_var("USE_PA_DECODE") and not (
-            _is_npu and self.nsa_enable_prefill_cp
+        use_pa_prefill = use_nsa_dsv4_pa_prefill()
+        use_pa_decode = use_nsa_dsv4_pa_decode()
+        need_compute_topk_idxs = (is_prefill and not use_pa_prefill) or (
+            not use_pa_decode and not is_prefill
         )
-        need_compute_topk_idxs = (
-            is_prefill and not get_bool_env_var("USE_PA_PREFILL")
-        ) or (not use_pa_decode and not is_prefill)
         if need_compute_topk_idxs:
             topk_idxs = get_window_topk_idxs(
                 num_tokens, self.window_size, forward_batch.seq_lens, is_prefill
@@ -1900,7 +1901,7 @@ class DeepseekV4AttentionMLA(nn.Module):
                 # An offset is required when using the original FA implementation;
                 # it can be removed once the fusion-kernel is integrated in the future.
                 offset = None
-                if is_prefill and not get_bool_env_var("USE_PA_PREFILL"):
+                if is_prefill and not use_pa_prefill:
                     offset = torch.cat(
                         [
                             torch.full(
@@ -1934,7 +1935,7 @@ class DeepseekV4AttentionMLA(nn.Module):
                 else:
                     compress_topk_idxs = None
             if is_prefill:
-                if get_bool_env_var("USE_PA_PREFILL"):
+                if use_pa_prefill:
                     topk_idxs = compress_topk_idxs
                 else:
                     topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
@@ -1956,7 +1957,7 @@ class DeepseekV4AttentionMLA(nn.Module):
                 kv[metadata.swa_loc_local],
                 None,
             )
-            if get_bool_env_var("USE_PA_PREFILL"):
+            if use_pa_prefill:
                 page_size = forward_batch.attn_backend.page_size
                 num_pages = (forward_batch.seq_lens_cpu + (page_size - 1)) // page_size
                 kv_pad = kv.new_zeros(

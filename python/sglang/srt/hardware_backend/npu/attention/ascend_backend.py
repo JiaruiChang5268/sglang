@@ -22,7 +22,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
+    use_nsa_dsv4_pa_decode,
+    use_nsa_dsv4_pa_prefill,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import (
@@ -914,14 +919,10 @@ class AscendAttnBackend(AttentionBackend):
                     )
 
         need_dsv4_kernel_metadata = self.is_dsv4 and (
-            (
-                forward_batch.forward_mode.is_decode()
-                and get_bool_env_var("USE_PA_DECODE")
-                and not is_nsa_enable_prefill_cp()
-            )
+            (forward_batch.forward_mode.is_decode() and use_nsa_dsv4_pa_decode())
             or (
                 forward_batch.forward_mode.is_prefill()
-                and get_bool_env_var("USE_PA_PREFILL")
+                and use_nsa_dsv4_pa_prefill()
             )
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
@@ -1604,7 +1605,7 @@ class AscendAttnBackend(AttentionBackend):
             swa_page_table = forward_batch.attn_backend.forward_metadata.swa_page_table
 
             if is_prefill:
-                use_pa_prefill = get_bool_env_var("USE_PA_PREFILL")
+                use_pa_prefill = use_nsa_dsv4_pa_prefill()
                 if use_pa_prefill:
                     kv_pad = k.unflatten(0, (-1, self.page_size))
                     cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
@@ -1617,6 +1618,37 @@ class AscendAttnBackend(AttentionBackend):
                         f"c{compress_ratio}a_metadata"
                     ]
                     q = q.squeeze(0)
+                    # For CP round-robin prefill, k is the gathered full-sequence K
+                    # (shape [total_len, 1, kv_dim]) with linear ordering 0..total_len-1.
+                    # swa_page_table maps logical positions to POOL slots, which for CP only
+                    # covers LOCAL tokens; non-local slots are uninitialized (typically 0).
+                    # Build a correct per-sequence block table: seq i, position j ->
+                    # kv_pad index = (sum of seq lengths before i) + j.  This bypasses
+                    # the broken pool-slot mapping and reads directly from the gathered K.
+                    if is_nsa_enable_prefill_cp():
+                        # seq_offsets[i] = start index of seq i inside kv_pad
+                        seq_lens_tensor = torch.tensor(
+                            forward_batch.seq_lens_cpu,
+                            dtype=swa_page_table.dtype,
+                            device=swa_page_table.device,
+                        )
+                        seq_offsets = torch.zeros(
+                            seq_lens_tensor.shape[0],
+                            dtype=swa_page_table.dtype,
+                            device=swa_page_table.device,
+                        )
+                        if seq_lens_tensor.shape[0] > 1:
+                            seq_offsets[1:] = seq_lens_tensor[:-1].cumsum(0)
+                        # arange across max seq len dimension
+                        max_blocks = swa_page_table.shape[1]
+                        arange = torch.arange(
+                            max_blocks,
+                            dtype=swa_page_table.dtype,
+                            device=swa_page_table.device,
+                        )
+                        ori_block_table = seq_offsets.unsqueeze(1) + arange.unsqueeze(0)
+                    else:
+                        ori_block_table = swa_page_table
                     attn_kwargs = {
                         "cu_seqlens_q": self.forward_metadata.actual_seq_lengths_q_pa,  # just for TND
                         "seqused_kv": self.forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, Tentative: kv_len 非压缩
@@ -1626,8 +1658,8 @@ class AscendAttnBackend(AttentionBackend):
                         "layout_q": "TND",  # "BSND" , "TND"
                         "layout_kv": "PA_ND",  # "PA_ND"
                         "q": q,
-                        "ori_kv": kv_pad,  # get from past_key_values, prefill is full cache, transfer bsnd to bbnd TODO： full cacheTODO：这里需要从0开始（最小index）
-                        "ori_block_table": swa_page_table,  # TODO full cache in prefill stage
+                        "ori_kv": kv_pad,  # gathered full-sequence K reshaped as pages
+                        "ori_block_table": ori_block_table,
                         "sinks": sinks,
                         "metadata": metadata,  # get from operator ?----sparse_attn_sharedkv_metadata
                         "softmax_scale": layer.scaling,
@@ -1672,7 +1704,29 @@ class AscendAttnBackend(AttentionBackend):
                     ):
                         q_i = q_i.unsqueeze(0)  # BSND
                         k_i = k_i.view(1, k_i.shape[0], k_i.shape[-1])  # T1D --> BSD
-                        topk_indices_i = topk_indices_i.unsqueeze(0)  # BSK
+                        topk_indices_i = topk_indices_i.unsqueeze(0)  # [1, S_q, K]
+                        if compress_ratio > 1:
+                            # topk_indices_i holds C4-block indices (range [0, S_k//ratio)),
+                            # but dsv4_sparse_attn builds an index_mask of size S_k+1 and
+                            # scatters them as token-level positions.  Without expansion,
+                            # only the first S_k//ratio token positions are ever unmasked,
+                            # causing Q tokens to miss all context beyond that point.
+                            # Fix: expand each block index j -> tokens [j*r, j*r+1, ..., j*r+r-1].
+                            # Invalid (-1) indices are mapped to S_k (the throw-away slot that
+                            # gets sliced off by index_mask[..., :-1]).
+                            S_k_i = k_i.shape[1]
+                            is_valid = topk_indices_i != -1  # [1, S_q, K]
+                            base = (topk_indices_i.clamp(min=0) * compress_ratio).unsqueeze(-1)  # [1, S_q, K, 1]
+                            offsets = torch.arange(compress_ratio, device=topk_indices_i.device)  # [ratio]
+                            expanded = base + offsets  # [1, S_q, K, ratio]
+                            expanded = torch.where(
+                                is_valid.unsqueeze(-1),
+                                expanded,
+                                torch.full_like(expanded, S_k_i),
+                            )
+                            topk_indices_i = expanded.reshape(
+                                1, topk_indices_i.shape[1], -1
+                            )  # [1, S_q, K*ratio]
                         o[offset : offset + q_i.shape[1]] = dsv4_sparse_attn(
                             q_i, k_i, sinks, topk_indices_i, layer.scaling
                         ).flatten(0, 1)
@@ -1681,9 +1735,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 o = q.new_empty((q.shape[0], q.shape[1], layer.head_dim))
 
-                use_pa_decode = get_bool_env_var(
-                    "USE_PA_DECODE"
-                ) and not is_nsa_enable_prefill_cp()
+                use_pa_decode = use_nsa_dsv4_pa_decode()
                 if use_pa_decode:
                     cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                         layer.layer_id, False
@@ -1836,6 +1888,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             is_prefill
             and is_nsa_enable_prefill_cp()
+            and is_nsa_prefill_cp_in_seq_split()
             and forward_batch.nsa_cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(

@@ -32,6 +32,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
+from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split, nsa_cp_round_robin_split_data
 from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
 )
@@ -207,6 +208,12 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for decode: full -> attn tp full
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
+            if is_nsa_prefill_cp_round_robin_split():
+                # All ranks have the same full hidden_states after gather;
+                # each rank selects its own strided tokens with no comms needed.
+                hidden_states = nsa_cp_round_robin_split_data(hidden_states)
+                return hidden_states, residual
+            # in-seq-split: existing reduce-scatter path
             input_hidden_states = hidden_states
             hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
                 context.attn_cp_rank
