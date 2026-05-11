@@ -1926,8 +1926,13 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv = forward_batch.seq_lens.index_select(
                     0, local_bs_idx.to(forward_batch.seq_lens.device)
                 )
-                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = actual_seq_lengths_q
-                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = actual_seq_lengths_kv
+                if not use_nsa_dsv4_pa_prefill():
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
+                        actual_seq_lengths_q
+                    )
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
+                        actual_seq_lengths_kv
+                    )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
@@ -2091,6 +2096,19 @@ class Indexer(MultiPlatformOp):
             compressor_x = x
             compressor_positions = positions
         self.compressor(compressor_x, compressor_positions, forward_batch)
+        if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+            logger.warning(
+                "DSV4 NPU sync debug after indexer compressor before synchronize: "
+                "layer=%s, compressor_x_shape=%s, positions_shape=%s",
+                layer_id,
+                tuple(compressor_x.shape),
+                tuple(compressor_positions.shape),
+            )
+            torch.npu.synchronize()
+            logger.warning(
+                "DSV4 NPU sync debug after indexer compressor synchronized: layer=%s",
+                layer_id,
+            )
 
         seqlens_cpu = forward_batch.seq_lens_cpu
 

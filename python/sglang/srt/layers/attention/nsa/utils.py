@@ -236,7 +236,7 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
         extra_seq = cur_len - cur_seq * cp_size
 
 
-def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs, keep_zeros=False):
     cp_size = get_attention_cp_size()
     cp_rank = get_attention_cp_rank()
     extra_seq = 0
@@ -246,6 +246,8 @@ def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
         cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
         q_seqs.append(cur_seq)
         extra_seq = cur_len - cur_seq * cp_size
+    if keep_zeros:
+        return q_seqs, list(range(len(q_seqs)))
     bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
     q_seqs = [q_len for q_len in q_seqs if q_len > 0]
     return q_seqs, bs_idx

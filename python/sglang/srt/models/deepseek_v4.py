@@ -1951,28 +1951,69 @@ class DeepseekV4AttentionMLA(nn.Module):
         # compress kv & attn
         if is_prefill:
             metadata = forward_batch.attn_backend.forward_metadata
+            use_pa_prefill_cp = use_pa_prefill and nsa_use_prefill_cp(forward_batch)
+            kv_for_cache = kv
+            if use_pa_prefill_cp:
+                kv_for_cache = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    _current_accelerator_stream(),
+                )
             forward_batch.token_to_kv_pool.set_swa_buffer(
                 self.attn_mha,
                 metadata.swa_loc,
-                kv[metadata.swa_loc_local],
+                kv_for_cache[metadata.swa_loc_local],
                 None,
             )
             if use_pa_prefill:
                 page_size = forward_batch.attn_backend.page_size
                 num_pages = (forward_batch.seq_lens_cpu + (page_size - 1)) // page_size
-                kv_pad = kv.new_zeros(
-                    (num_pages.sum().item() * page_size, kv.shape[-1])
+                kv_pad = kv_for_cache.new_zeros(
+                    (num_pages.sum().item() * page_size, kv_for_cache.shape[-1])
                 )
                 assert metadata.swa_kv_tobe_scatter_index is not None
-                kv_pad[metadata.swa_kv_tobe_scatter_index] = kv
+                kv_pad[metadata.swa_kv_tobe_scatter_index] = kv_for_cache
             else:
                 kv_pad = kv
             if self.compress_ratio > 1:
+                compressor_x = x
+                compressor_positions = positions
+                if use_pa_prefill_cp:
+                    compressor_x = cp_all_gather_rerange_output(
+                        x.contiguous(),
+                        self.cp_size,
+                        forward_batch,
+                        _current_accelerator_stream(),
+                    )
+                    compressor_positions = cp_all_gather_rerange_output(
+                        positions.contiguous().unsqueeze(-1),
+                        self.cp_size,
+                        forward_batch,
+                        _current_accelerator_stream(),
+                    ).squeeze(-1)
                 if (
                     kv_compress := self.compressor(
-                        x, positions, forward_batch
+                        compressor_x, compressor_positions, forward_batch
                     )  # compress/state
                 ) is not None:
+                    if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                        logger.warning(
+                            "DSV4 NPU sync debug after attention compressor before synchronize: "
+                            "layer=%s, compress_ratio=%s, compressor_x_shape=%s, "
+                            "positions_shape=%s",
+                            self.layer_id,
+                            self.compress_ratio,
+                            tuple(compressor_x.shape),
+                            tuple(compressor_positions.shape),
+                        )
+                        torch.npu.synchronize()
+                        logger.warning(
+                            "DSV4 NPU sync debug after attention compressor synchronized: "
+                            "layer=%s, compress_ratio=%s",
+                            self.layer_id,
+                            self.compress_ratio,
+                        )
                     kv_split_seq = forward_batch.seq_lens_cpu
                     kv_list = kv_pad.split(kv_split_seq.tolist(), dim=0)
 

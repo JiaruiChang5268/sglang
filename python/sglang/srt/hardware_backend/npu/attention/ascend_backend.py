@@ -23,8 +23,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
+    nsa_cp_round_robin_split_q_seqs_cpu,
     use_nsa_dsv4_pa_decode,
     use_nsa_dsv4_pa_prefill,
 )
@@ -463,12 +465,27 @@ class AscendAttnBackend(AttentionBackend):
         max_seqlen_q: int,
         is_nextn=False,
     ):
+        max_seqlen_q = (
+            int(max_seqlen_q.item())
+            if isinstance(max_seqlen_q, torch.Tensor)
+            else int(max_seqlen_q)
+        )
+        max_seqlen_kv_actual = (
+            int(forward_metadata.actual_seq_lengths_kv.max().item())
+            if forward_metadata.actual_seq_lengths_kv is not None
+            and forward_metadata.actual_seq_lengths_kv.numel() > 0
+            else 0
+        )
+        max_seqlen_kv = (
+            ((max_seqlen_kv_actual + self.page_size - 1) // self.page_size)
+            * self.page_size
+            if max_seqlen_kv_actual > 0
+            else 0
+        )
         fa_common_kwargs = {
             "cu_seqlens_q": forward_metadata.actual_seq_lengths_q_pa,  # just for TND: 0,1,2,3,4,5; B+1
             "seqused_kv": forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, kv_len TODO: 确认压缩的怎么填
-            "cmp_ratio": 1,  # no support 1, None.   TODO repair this after package updated
             "ori_mask_mode": 4,  # sliding window
-            "cmp_mask_mode": 3,  # causal
             "ori_win_left": self.config.sliding_window_size - 1,
             "ori_win_right": 0,
             "layout_q": "TND",  # "BSND" , "TND"
@@ -487,30 +504,97 @@ class AscendAttnBackend(AttentionBackend):
         }
         kernel_metadata = {}
         c1a_metadata_kwargs = c1a_metadata_kwargs | fa_common_kwargs
+        if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
+            logger.warning(
+                "DSV4 NPU c1a metadata kwargs keys=%s",
+                sorted(c1a_metadata_kwargs.keys()),
+            )
+        if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
+
+            logger.warning(
+                "DSV4 NPU sharedkv metadata args: "
+                "batch_size=%s, max_seqlen_q=%s, max_seqlen_kv_actual=%s, "
+                "max_seqlen_kv=%s, "
+                "device=%s, is_nextn=%s, has_c4_kv=%s, has_c128_kv=%s, "
+                "num_heads_q=%s, num_heads_kv=%s, head_dim=%s, "
+                "cu_seqlens_q=%s, seqused_kv=%s",
+                batch_size,
+                max_seqlen_q,
+                max_seqlen_kv_actual,
+                max_seqlen_kv,
+                str(forward_metadata.actual_seq_lengths_q_pa.device),
+                is_nextn,
+                max_seqlen_kv_actual >= 4,
+                max_seqlen_kv_actual >= 128,
+                q_head_num,
+                kv_head_num,
+                self.config.head_dim,
+                self._debug_tensor_brief(forward_metadata.actual_seq_lengths_q_pa),
+                self._debug_tensor_brief(forward_metadata.actual_seq_lengths_kv),
+            )
+            if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                logger.warning("DSV4 NPU sync debug before c1a metadata synchronize")
+                torch.npu.synchronize()
+                logger.warning("DSV4 NPU sync debug before c1a metadata synchronized")
+
+        cu_seqlens_q = c1a_metadata_kwargs["cu_seqlens_q"]
+        seqused_kv = c1a_metadata_kwargs["seqused_kv"]
+
+        c1a_metadata_kwargs["cu_seqlens_q"] = torch.tensor(
+            cu_seqlens_q.detach().cpu().tolist(),
+            dtype=torch.int32,
+            device=cu_seqlens_q.device,
+        )
+        c1a_metadata_kwargs["seqused_kv"] = torch.tensor(
+            seqused_kv.detach().cpu().tolist(),
+            dtype=torch.int32,
+            device=seqused_kv.device,
+        )
         c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
             **c1a_metadata_kwargs
         )
+        if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+            torch.npu.synchronize()
+            logger.warning("DSV4 NPU sync debug after c1a metadata synchronized")
         kernel_metadata.update({"c1a_metadata": c1a_metadata})
         if not is_nextn:
             # scfa_metadata
-            c4a_metadata_kwargs = {
-                "cmp_ratio": 4,
-                "has_cmp_kv": True,
-                "cmp_topk": self.index_topk,
-            }
-            c4a_metadata_kwargs = c1a_metadata_kwargs | c4a_metadata_kwargs
-            c4a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c4a_metadata_kwargs
-            )
+            if max_seqlen_kv_actual >= 4:
+                c4a_metadata_kwargs = {
+                    "cmp_ratio": 4,
+                    "cmp_mask_mode": 3,
+                    "has_cmp_kv": True,
+                    "cmp_topk": self.index_topk,
+                }
+                c4a_metadata_kwargs = c1a_metadata_kwargs | c4a_metadata_kwargs
+                c4a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    **c4a_metadata_kwargs
+                )
+                if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                    torch.npu.synchronize()
+                    logger.warning("DSV4 NPU sync debug after c4a metadata synchronized")
+            else:
+                c4a_metadata = c1a_metadata
             kernel_metadata.update({"c4a_metadata": c4a_metadata})
 
             # cfa_metadata
-            c128a_metadata_kwargs = {"cmp_ratio": 128, "has_cmp_kv": True}
-            c128a_metadata_kwargs = c1a_metadata_kwargs | c128a_metadata_kwargs
-
-            c128a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c128a_metadata_kwargs
-            )
+            if max_seqlen_kv_actual >= 128:
+                c128a_metadata_kwargs = {
+                    "cmp_ratio": 128,
+                    "cmp_mask_mode": 3,
+                    "has_cmp_kv": True,
+                }
+                c128a_metadata_kwargs = c1a_metadata_kwargs | c128a_metadata_kwargs
+                c128a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    **c128a_metadata_kwargs
+                )
+                if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                    torch.npu.synchronize()
+                    logger.warning(
+                        "DSV4 NPU sync debug after c128a metadata synchronized"
+                    )
+            else:
+                c128a_metadata = c1a_metadata
             kernel_metadata.update({"c128a_metadata": c128a_metadata})
 
             # li_quant_metadata
@@ -564,6 +648,33 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.actual_seq_lengths_q_pa.clone()
                 )
                 max_seqlen_q = seq_lens_max
+
+                if (
+                    use_nsa_dsv4_pa_prefill()
+                    and can_nsa_prefill_cp_round_robin_split(forward_batch)
+                ):
+                    local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+                        forward_batch.extend_seq_lens_cpu,
+                        keep_zeros=True,
+                    )
+                    local_q_lens = torch.tensor(
+                        local_q_lens_cpu,
+                        dtype=torch.int32,
+                        device=self.forward_metadata.actual_seq_lengths_q.device,
+                    )
+                    local_q_cumsum = local_q_lens.cumsum(0)
+                    self.forward_metadata.actual_seq_lengths_q_pa = torch.cat(
+                        [
+                            torch.tensor(
+                                [0],
+                                dtype=torch.int32,
+                                device=local_q_cumsum.device,
+                            ),
+                            local_q_cumsum,
+                        ],
+                        dim=0,
+                    )
+                    max_seqlen_q = max(local_q_lens_cpu, default=0)
 
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
@@ -928,6 +1039,56 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
         if need_dsv4_kernel_metadata:
+            if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
+                out_cache_loc = forward_batch.out_cache_loc_dsv4
+                logger.warning(
+                    "DSV4 NPU forward metadata state: "
+                    "mode=%s, batch_size=%s, seq_lens_cpu=%s, "
+                    "seq_lens=%s, extend_seq_lens_cpu=%s, req_pool_indices=%s, "
+                    "swa_loc=%s, c4_loc=%s, c128_loc=%s, c4_state_loc=%s, "
+                    "actual_q=%s, actual_q_pa=%s, actual_kv=%s, "
+                    "swa_page_table=%s, c4_page_table=%s, c128_page_table=%s",
+                    forward_batch.forward_mode,
+                    forward_batch.batch_size,
+                    getattr(forward_batch, "seq_lens_cpu", None),
+                    self._debug_tensor_brief(getattr(forward_batch, "seq_lens", None)),
+                    getattr(forward_batch, "extend_seq_lens_cpu", None),
+                    self._debug_tensor_brief(
+                        getattr(forward_batch, "req_pool_indices", None)
+                    ),
+                    self._debug_tensor_brief(
+                        getattr(out_cache_loc, "out_swa_loc", None)
+                        if out_cache_loc is not None
+                        else None
+                    ),
+                    self._debug_tensor_brief(
+                        getattr(out_cache_loc, "out_c4_loc", None)
+                        if out_cache_loc is not None
+                        else None
+                    ),
+                    self._debug_tensor_brief(
+                        getattr(out_cache_loc, "out_c128_loc", None)
+                        if out_cache_loc is not None
+                        else None
+                    ),
+                    self._debug_tensor_brief(
+                        getattr(out_cache_loc, "out_c4_state_loc", None)
+                        if out_cache_loc is not None
+                        else None
+                    ),
+                    self._debug_tensor_brief(
+                        self.forward_metadata.actual_seq_lengths_q
+                    ),
+                    self._debug_tensor_brief(
+                        self.forward_metadata.actual_seq_lengths_q_pa
+                    ),
+                    self._debug_tensor_brief(
+                        self.forward_metadata.actual_seq_lengths_kv
+                    ),
+                    self._debug_tensor_brief(self.forward_metadata.swa_page_table),
+                    self._debug_tensor_brief(self.forward_metadata.c4_page_table),
+                    self._debug_tensor_brief(self.forward_metadata.c128_page_table),
+                )
             self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
                 forward_batch.batch_size,
                 self.forward_metadata,
@@ -1381,6 +1542,26 @@ class AscendAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
+    @staticmethod
+    def _debug_tensor_brief(tensor: Optional[torch.Tensor]):
+        if tensor is None:
+            return None
+        ret = {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+        }
+        try:
+            if tensor.numel() <= 64:
+                ret["values"] = tensor.detach().cpu().tolist()
+            else:
+                ret["first"] = tensor.flatten()[:8].detach().cpu().tolist()
+                ret["last"] = tensor.flatten()[-8:].detach().cpu().tolist()
+                ret["numel"] = tensor.numel()
+        except Exception as e:
+            ret["error"] = repr(e)
+        return ret
+
     def _generate_alibi_bias(
         self,
         seq_len: int,
@@ -1603,50 +1784,82 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 compress_page_table = None
             swa_page_table = forward_batch.attn_backend.forward_metadata.swa_page_table
+            has_compress_kv = (
+                compress_ratio in (4, 128)
+                and max(forward_batch.seq_lens_cpu.tolist(), default=0)
+                >= compress_ratio
+            )
 
             if is_prefill:
-                use_pa_prefill = use_nsa_dsv4_pa_prefill()
+                skip_pa_prefill_sharedkv = get_bool_env_var(
+                    "SGLANG_DSV4_NPU_SKIP_PA_PREFILL_SHAREDKV", "False"
+                )
+                use_pa_prefill = (
+                    use_nsa_dsv4_pa_prefill() and not skip_pa_prefill_sharedkv
+                )
+                if (
+                    skip_pa_prefill_sharedkv
+                    and get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False")
+                ):
+                    logger.warning(
+                        "DSV4 NPU sync debug skip PA prefill sharedkv: "
+                        "layer=%s, compress_ratio=%s",
+                        layer.layer_id,
+                        compress_ratio,
+                    )
+                if skip_pa_prefill_sharedkv:
+                    o = q.new_zeros(q.shape)
+                    return o
                 if use_pa_prefill:
                     kv_pad = k.unflatten(0, (-1, self.page_size))
                     cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
                         layer.layer_id, False
                     )  #
-                    ori_kv = forward_batch.token_to_kv_pool.get_swa_buffer(
-                        layer.layer_id
-                    )  # [num_block, page_size, 1, dim]
+                    topk_valid_count = None
+                    topk_indices_for_cmp = topk_indices
+                    effective_has_compress_kv = has_compress_kv
+                    if compress_ratio == 4 and has_compress_kv:
+                        topk_indices_for_cmp = topk_indices.view(
+                            -1, 1, topk_indices.shape[-1]
+                        )
+                        topk_valid_count = int((topk_indices_for_cmp >= 0).sum().item())
+                        effective_has_compress_kv = topk_valid_count > 0
                     metadata = self.forward_metadata.kernel_metadata[
                         f"c{compress_ratio}a_metadata"
+                        if effective_has_compress_kv
+                        else "c1a_metadata"
                     ]
                     q = q.squeeze(0)
-                    # For CP round-robin prefill, k is the gathered full-sequence K
-                    # (shape [total_len, 1, kv_dim]) with linear ordering 0..total_len-1.
-                    # swa_page_table maps logical positions to POOL slots, which for CP only
-                    # covers LOCAL tokens; non-local slots are uninitialized (typically 0).
-                    # Build a correct per-sequence block table: seq i, position j ->
-                    # kv_pad index = (sum of seq lengths before i) + j.  This bypasses
-                    # the broken pool-slot mapping and reads directly from the gathered K.
                     if is_nsa_enable_prefill_cp():
-                        # seq_offsets[i] = start index of seq i inside kv_pad
                         seq_lens_tensor = torch.tensor(
                             forward_batch.seq_lens_cpu,
                             dtype=swa_page_table.dtype,
                             device=swa_page_table.device,
                         )
-                        seq_offsets = torch.zeros(
-                            seq_lens_tensor.shape[0],
+                        num_pages_tensor = (
+                            seq_lens_tensor + self.page_size - 1
+                        ) // self.page_size
+                        page_offsets = torch.zeros(
+                            num_pages_tensor.shape[0],
                             dtype=swa_page_table.dtype,
                             device=swa_page_table.device,
                         )
-                        if seq_lens_tensor.shape[0] > 1:
-                            seq_offsets[1:] = seq_lens_tensor[:-1].cumsum(0)
-                        # arange across max seq len dimension
+                        if num_pages_tensor.shape[0] > 1:
+                            page_offsets[1:] = num_pages_tensor[:-1].cumsum(0)
                         max_blocks = swa_page_table.shape[1]
                         arange = torch.arange(
                             max_blocks,
                             dtype=swa_page_table.dtype,
                             device=swa_page_table.device,
                         )
-                        ori_block_table = seq_offsets.unsqueeze(1) + arange.unsqueeze(0)
+                        ori_block_table = page_offsets.unsqueeze(1) + arange.unsqueeze(
+                            0
+                        )
+                        ori_block_table = torch.where(
+                            arange.unsqueeze(0) < num_pages_tensor.unsqueeze(1),
+                            ori_block_table,
+                            torch.zeros_like(ori_block_table),
+                        )
                     else:
                         ori_block_table = swa_page_table
                     attn_kwargs = {
@@ -1665,8 +1878,8 @@ class AscendAttnBackend(AttentionBackend):
                         "softmax_scale": layer.scaling,
                     }
 
-                    if compress_ratio == 4:
-                        topk_indices = topk_indices.view(-1, 1, topk_indices.shape[-1])
+                    if compress_ratio == 4 and effective_has_compress_kv:
+                        topk_indices = topk_indices_for_cmp
                         c_kwargs = {
                             "cmp_ratio": compress_ratio,  # no support 1, None
                             "cmp_mask_mode": 3,  # causal
@@ -1675,7 +1888,7 @@ class AscendAttnBackend(AttentionBackend):
                             "cmp_block_table": compress_page_table,
                         }
                         attn_kwargs = attn_kwargs | c_kwargs
-                    elif compress_ratio == 128:
+                    elif compress_ratio == 128 and effective_has_compress_kv:
                         c_kwargs = {
                             "cmp_ratio": compress_ratio,  # no support 1, None
                             "cmp_mask_mode": 3,  # causal
@@ -1685,7 +1898,40 @@ class AscendAttnBackend(AttentionBackend):
                         }
                         attn_kwargs = attn_kwargs | c_kwargs
 
+                    if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                        logger.warning(
+                            "DSV4 NPU sync debug before PA prefill sharedkv: "
+                            "layer=%s, compress_ratio=%s, has_compress_kv=%s, "
+                            "effective_has_compress_kv=%s, topk_valid_count=%s, "
+                            "q_shape=%s, kv_shape=%s, cmp_kv_shape=%s, "
+                            "ori_block_table=%s, cmp_block_table=%s, topk=%s",
+                            layer.layer_id,
+                            compress_ratio,
+                            has_compress_kv,
+                            effective_has_compress_kv,
+                            topk_valid_count,
+                            tuple(q.shape),
+                            tuple(kv_pad.shape),
+                            tuple(cmp_kv.shape) if cmp_kv is not None else None,
+                            self._debug_tensor_brief(ori_block_table),
+                            self._debug_tensor_brief(compress_page_table),
+                            self._debug_tensor_brief(topk_indices_for_cmp),
+                        )
                     o, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+                    if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                        logger.warning(
+                            "DSV4 NPU sync debug after PA prefill sharedkv before synchronize: "
+                            "layer=%s, compress_ratio=%s",
+                            layer.layer_id,
+                            compress_ratio,
+                        )
+                        torch.npu.synchronize()
+                        logger.warning(
+                            "DSV4 NPU sync debug after PA prefill sharedkv synchronized: "
+                            "layer=%s, compress_ratio=%s",
+                            layer.layer_id,
+                            compress_ratio,
+                        )
                 else:
                     split_seq = forward_batch.seq_lens_cpu
                     split_seq = split_seq.tolist()
@@ -1745,6 +1991,8 @@ class AscendAttnBackend(AttentionBackend):
                     )  # [T, 1, D]
                     metadata = self.forward_metadata.kernel_metadata[
                         f"c{compress_ratio}a_metadata"
+                        if has_compress_kv
+                        else "c1a_metadata"
                     ]
 
                     attn_kwargs = {
@@ -1763,7 +2011,7 @@ class AscendAttnBackend(AttentionBackend):
                         "softmax_scale": layer.scaling,
                     }
 
-                    if compress_ratio == 4:
+                    if compress_ratio == 4 and has_compress_kv:
                         topk_indices = topk_indices.view(-1, 1, topk_indices.shape[-1])
                         c_kwargs = {
                             "cmp_ratio": compress_ratio,  # no support 1, None
@@ -1773,7 +2021,7 @@ class AscendAttnBackend(AttentionBackend):
                             "cmp_block_table": compress_page_table,
                         }
                         attn_kwargs = attn_kwargs | c_kwargs
-                    elif compress_ratio == 128:
+                    elif compress_ratio == 128 and has_compress_kv:
                         c_kwargs = {
                             "cmp_ratio": compress_ratio,  # no support 1, None
                             "cmp_mask_mode": 3,  # causal
