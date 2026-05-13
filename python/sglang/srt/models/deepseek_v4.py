@@ -64,15 +64,17 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Compressor, Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
+    can_nsa_prefill_cp_round_robin_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    effective_use_nsa_dsv4_pa_prefill,
+    get_nsa_prefill_cp_total_len,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
     use_nsa_dsv4_pa_decode,
-    use_nsa_dsv4_pa_prefill,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import (
@@ -369,6 +371,25 @@ def get_window_topk_idxs(
     return window_topk_idxs
 
 
+def get_window_topk_idxs_from_positions(
+    num_tokens: int, window_size: int, positions: torch.Tensor
+):
+    window_topk_idxs = torch.full(
+        (num_tokens, window_size), -1, dtype=torch.int32, device=positions.device
+    )
+    if num_tokens == 0:
+        return window_topk_idxs
+
+    local_positions = positions[:num_tokens].to(torch.int32)
+    offset = torch.arange(window_size, dtype=torch.int32, device=positions.device)
+    start = (local_positions.unsqueeze(1) - window_size + 1).clamp(min=0)
+    matrix = start + offset
+    window_topk_idxs = torch.where(
+        matrix > local_positions.unsqueeze(1), -1, matrix
+    )
+    return window_topk_idxs
+
+
 @lru_cache(2)
 def get_compress_topk_idxs(
     num_tokens,
@@ -412,6 +433,30 @@ def get_compress_topk_idxs(
 
         seq_len_offset += seq_len
     return compress_topk_idxs
+
+
+def get_compress_topk_idxs_from_positions(
+    num_tokens: int,
+    ratio: int,
+    positions: torch.Tensor,
+    kv_len: int,
+    need_add_offset: bool,
+):
+    max_len = kv_len // ratio
+    compress_topk_idxs = torch.full(
+        (num_tokens, max_len), -1, dtype=torch.int32, device=positions.device
+    )
+    if num_tokens == 0 or max_len == 0:
+        return compress_topk_idxs
+
+    local_positions = positions[:num_tokens].to(torch.int32)
+    matrix = torch.arange(
+        max_len, dtype=torch.int32, device=positions.device
+    ).repeat(num_tokens, 1)
+    mask = matrix >= local_positions.add(1).unsqueeze(1) // ratio
+    if need_add_offset:
+        matrix = matrix + kv_len
+    return torch.where(mask, -1, matrix)
 
 
 class AttnForwardMethod(IntEnum):
@@ -1876,15 +1921,20 @@ class DeepseekV4AttentionMLA(nn.Module):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
-        use_pa_prefill = use_nsa_dsv4_pa_prefill()
+        use_pa_prefill = effective_use_nsa_dsv4_pa_prefill(forward_batch)
         use_pa_decode = use_nsa_dsv4_pa_decode()
         need_compute_topk_idxs = (is_prefill and not use_pa_prefill) or (
             not use_pa_decode and not is_prefill
         )
         if need_compute_topk_idxs:
-            topk_idxs = get_window_topk_idxs(
-                num_tokens, self.window_size, forward_batch.seq_lens, is_prefill
-            )
+            if is_prefill and can_nsa_prefill_cp_round_robin_split(forward_batch):
+                topk_idxs = get_window_topk_idxs_from_positions(
+                    num_tokens, self.window_size, positions
+                )
+            else:
+                topk_idxs = get_window_topk_idxs(
+                    num_tokens, self.window_size, forward_batch.seq_lens, is_prefill
+                )
         else:
             topk_idxs = None
 
@@ -1902,18 +1952,26 @@ class DeepseekV4AttentionMLA(nn.Module):
                 # it can be removed once the fusion-kernel is integrated in the future.
                 offset = None
                 if is_prefill and not use_pa_prefill:
-                    offset = torch.cat(
-                        [
-                            torch.full(
-                                (seq_len, 1),
-                                seq_len,
-                                dtype=compress_topk_idxs.dtype,
-                                device=compress_topk_idxs.device,
-                            )
-                            for seq_len in forward_batch.seq_lens
-                        ],
-                        dim=0,
-                    )
+                    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                        offset = torch.full(
+                            (num_tokens, 1),
+                            get_nsa_prefill_cp_total_len(forward_batch),
+                            dtype=compress_topk_idxs.dtype,
+                            device=compress_topk_idxs.device,
+                        )
+                    else:
+                        offset = torch.cat(
+                            [
+                                torch.full(
+                                    (seq_len, 1),
+                                    seq_len,
+                                    dtype=compress_topk_idxs.dtype,
+                                    device=compress_topk_idxs.device,
+                                )
+                                for seq_len in forward_batch.seq_lens
+                            ],
+                            dim=0,
+                        )
                 if not is_prefill and not use_pa_decode:
                     offset = self.window_size
                 if offset is not None:
@@ -1924,14 +1982,25 @@ class DeepseekV4AttentionMLA(nn.Module):
                     )
             else:
                 if need_compute_topk_idxs:
-                    compress_topk_idxs = get_compress_topk_idxs(
-                        num_tokens,
-                        self.compress_ratio,
-                        forward_batch.seq_lens,
-                        window_size=self.window_size,
-                        is_prefill=is_prefill,
-                        need_add_offset=need_compute_topk_idxs,
-                    )
+                    if is_prefill and can_nsa_prefill_cp_round_robin_split(
+                        forward_batch
+                    ):
+                        compress_topk_idxs = get_compress_topk_idxs_from_positions(
+                            num_tokens,
+                            self.compress_ratio,
+                            positions,
+                            get_nsa_prefill_cp_total_len(forward_batch),
+                            need_add_offset=need_compute_topk_idxs,
+                        )
+                    else:
+                        compress_topk_idxs = get_compress_topk_idxs(
+                            num_tokens,
+                            self.compress_ratio,
+                            forward_batch.seq_lens,
+                            window_size=self.window_size,
+                            is_prefill=is_prefill,
+                            need_add_offset=need_compute_topk_idxs,
+                        )
                 else:
                     compress_topk_idxs = None
             if is_prefill:
@@ -1951,9 +2020,9 @@ class DeepseekV4AttentionMLA(nn.Module):
         # compress kv & attn
         if is_prefill:
             metadata = forward_batch.attn_backend.forward_metadata
-            use_pa_prefill_cp = use_pa_prefill and nsa_use_prefill_cp(forward_batch)
+            use_prefill_cp = can_nsa_prefill_cp_round_robin_split(forward_batch)
             kv_for_cache = kv
-            if use_pa_prefill_cp:
+            if use_prefill_cp:
                 kv_for_cache = cp_all_gather_rerange_output(
                     kv.contiguous(),
                     self.cp_size,
@@ -1975,11 +2044,11 @@ class DeepseekV4AttentionMLA(nn.Module):
                 assert metadata.swa_kv_tobe_scatter_index is not None
                 kv_pad[metadata.swa_kv_tobe_scatter_index] = kv_for_cache
             else:
-                kv_pad = kv
+                kv_pad = kv_for_cache
             if self.compress_ratio > 1:
                 compressor_x = x
                 compressor_positions = positions
-                if use_pa_prefill_cp:
+                if use_prefill_cp:
                     compressor_x = cp_all_gather_rerange_output(
                         x.contiguous(),
                         self.cp_size,

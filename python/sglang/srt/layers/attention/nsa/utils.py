@@ -13,11 +13,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -41,6 +43,12 @@ def use_nsa_dsv4_pa_prefill():
     return get_bool_env_var("USE_PA_PREFILL")
 
 
+def effective_use_nsa_dsv4_pa_prefill(forward_batch: "ForwardBatch"):
+    if not use_nsa_dsv4_pa_prefill():
+        return False
+    return not can_nsa_prefill_cp_round_robin_split(forward_batch)
+
+
 def use_nsa_dsv4_pa_decode():
     # PA decode is compatible with prefill CP once DSV4 attention weights are replicated.
     return get_bool_env_var("USE_PA_DECODE")
@@ -60,15 +68,34 @@ def is_nsa_prefill_cp_round_robin_split():
     )
 
 
+def get_nsa_prefill_cp_rank():
+    if is_nsa_prefill_cp_round_robin_split():
+        return get_attention_tp_rank()
+    return get_attention_cp_rank()
+
+
+def get_nsa_prefill_cp_size():
+    if is_nsa_prefill_cp_round_robin_split():
+        return get_attention_tp_size()
+    return get_attention_cp_size()
+
+
+def get_nsa_prefill_cp_total_len(forward_batch: "ForwardBatch"):
+    global_num_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    if global_num_tokens is None:
+        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_num_tokens is not None:
+        if len(global_num_tokens) > 1:
+            return int(global_num_tokens[get_attention_dp_rank()])
+        return int(global_num_tokens[0])
+    return int(sum(forward_batch.extend_seq_lens_cpu))
+
+
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
-        return False
-    cp_size = get_attention_cp_size()
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
+    cp_size = get_nsa_prefill_cp_size()
     return (
         is_nsa_prefill_cp_round_robin_split()
-        and seq_len > 0
-        and seq_len >= cp_size
+        and forward_batch.forward_mode.is_prefill()
         and cp_size > 1
     )
 
@@ -86,8 +113,8 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
     |   +-------------------------+
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
     if isinstance(input_, (tuple, list)):
         indices = range(cp_rank, len(input_), cp_size)
         return input_[indices]
@@ -109,7 +136,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_nsa_prefill_cp_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
@@ -127,7 +154,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_nsa_prefill_cp_size()
     needs_cp_pad = attn_cp_size > 1 and can_nsa_prefill_cp_round_robin_split(
         forward_batch
     )
@@ -237,8 +264,8 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
 
 
 def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs, keep_zeros=False):
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
@@ -265,8 +292,8 @@ def nsa_cp_round_robin_split_q_seqs(
     bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
         i.e., those with a partitioned length greater than zero.
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
@@ -285,9 +312,15 @@ def nsa_cp_round_robin_split_q_seqs(
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+    if not nsa_enable_prefill_cp:
+        return False
+    if is_nsa_prefill_cp_round_robin_split():
+        return (
+            forward_batch.forward_mode.is_prefill()
+            and get_nsa_prefill_cp_size() > 1
+        )
     if (
         forward_batch.nsa_cp_metadata is not None
-        and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
         return True
@@ -367,7 +400,8 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     if is_nsa_prefill_cp_round_robin_split():
-        total_len = sum(forward_batch.extend_seq_lens_cpu)
+        cp_size = get_nsa_prefill_cp_size()
+        total_len = get_nsa_prefill_cp_total_len(forward_batch)
         if input_tensor.shape[0] == total_len:
             return input_tensor
         max_len = ceil_div(total_len, cp_size)
@@ -382,15 +416,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_len]
             input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
         with use_symmetric_memory(
-            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            get_attention_tp_group(), disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
                 (max_len * cp_size, *input_tensor.shape[1:]),
             )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
+        get_attention_tp_group().all_gather_into_tensor(output_tensor, input_tensor)
         out_shape = output_tensor.shape
         output_tensor = (
             output_tensor.view(cp_size, -1, *out_shape[1:])

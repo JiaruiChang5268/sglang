@@ -24,13 +24,20 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
+    effective_use_nsa_dsv4_pa_prefill,
+    get_nsa_prefill_cp_size,
+    get_nsa_prefill_cp_total_len,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     is_nsa_prefill_cp_in_seq_split,
     nsa_cp_round_robin_split_q_seqs_cpu,
     use_nsa_dsv4_pa_decode,
     use_nsa_dsv4_pa_prefill,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -57,6 +64,10 @@ def _reshape_kv_for_fia_nz(
 
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv4_debug_rank0() -> bool:
+    return get_attention_tp_rank() == 0
 
 
 def dsv4_sparse_attn(
@@ -504,13 +515,13 @@ class AscendAttnBackend(AttentionBackend):
         }
         kernel_metadata = {}
         c1a_metadata_kwargs = c1a_metadata_kwargs | fa_common_kwargs
-        if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
-            logger.warning(
-                "DSV4 NPU c1a metadata kwargs keys=%s",
-                sorted(c1a_metadata_kwargs.keys()),
-            )
-        if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
-
+        metadata_debug_rank0 = (
+            get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False")
+            and _dsv4_debug_rank0()
+        )
+        sync_debug = get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False")
+        sync_debug_rank0 = sync_debug and _dsv4_debug_rank0()
+        if metadata_debug_rank0:
             logger.warning(
                 "DSV4 NPU sharedkv metadata args: "
                 "batch_size=%s, max_seqlen_q=%s, max_seqlen_kv_actual=%s, "
@@ -532,10 +543,6 @@ class AscendAttnBackend(AttentionBackend):
                 self._debug_tensor_brief(forward_metadata.actual_seq_lengths_q_pa),
                 self._debug_tensor_brief(forward_metadata.actual_seq_lengths_kv),
             )
-            if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
-                logger.warning("DSV4 NPU sync debug before c1a metadata synchronize")
-                torch.npu.synchronize()
-                logger.warning("DSV4 NPU sync debug before c1a metadata synchronized")
 
         cu_seqlens_q = c1a_metadata_kwargs["cu_seqlens_q"]
         seqused_kv = c1a_metadata_kwargs["seqused_kv"]
@@ -553,9 +560,10 @@ class AscendAttnBackend(AttentionBackend):
         c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
             **c1a_metadata_kwargs
         )
-        if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+        if sync_debug:
             torch.npu.synchronize()
-            logger.warning("DSV4 NPU sync debug after c1a metadata synchronized")
+            if sync_debug_rank0:
+                logger.warning("DSV4 NPU sync debug after c1a metadata synchronized")
         kernel_metadata.update({"c1a_metadata": c1a_metadata})
         if not is_nextn:
             # scfa_metadata
@@ -570,9 +578,12 @@ class AscendAttnBackend(AttentionBackend):
                 c4a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
                     **c4a_metadata_kwargs
                 )
-                if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                if sync_debug:
                     torch.npu.synchronize()
-                    logger.warning("DSV4 NPU sync debug after c4a metadata synchronized")
+                    if sync_debug_rank0:
+                        logger.warning(
+                            "DSV4 NPU sync debug after c4a metadata synchronized"
+                        )
             else:
                 c4a_metadata = c1a_metadata
             kernel_metadata.update({"c4a_metadata": c4a_metadata})
@@ -588,14 +599,29 @@ class AscendAttnBackend(AttentionBackend):
                 c128a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
                     **c128a_metadata_kwargs
                 )
-                if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                if sync_debug:
                     torch.npu.synchronize()
-                    logger.warning(
-                        "DSV4 NPU sync debug after c128a metadata synchronized"
-                    )
+                    if sync_debug_rank0:
+                        logger.warning(
+                            "DSV4 NPU sync debug after c128a metadata synchronized"
+                        )
             else:
                 c128a_metadata = c1a_metadata
             kernel_metadata.update({"c128a_metadata": c128a_metadata})
+
+            # Keep c1a as the final sharedkv metadata call after any compressed
+            # metadata call.  Some NPU AICPU builds reject a later c1a call after
+            # the previous metadata call used has_cmp_kv=True.
+            if max_seqlen_kv_actual >= 4:
+                _ = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                    **c1a_metadata_kwargs
+                )
+                if sync_debug:
+                    torch.npu.synchronize()
+                    if sync_debug_rank0:
+                        logger.warning(
+                            "DSV4 NPU sync debug after final cmp-state reset synchronized"
+                        )
 
             # li_quant_metadata
             li_quant_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
@@ -649,10 +675,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 max_seqlen_q = seq_lens_max
 
-                if (
-                    use_nsa_dsv4_pa_prefill()
-                    and can_nsa_prefill_cp_round_robin_split(forward_batch)
-                ):
+                if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                    # keep_zeros=True: include 0-length entries for sequences
+                    # whose tokens all land on other CP ranks.  This keeps
+                    # actual_seq_lengths_q_pa aligned with forward_batch.batch_size
+                    # (one boundary per sequence, matching seqused_kv).
+                    # NOTE: for multi-seq batches where a sequence has 0 local
+                    # tokens, topk_indices (keep_zeros=False from indexer) will
+                    # have fewer rows than cu_seqlens_q implies; fix needed when
+                    # multi-seq CP batches become a supported configuration.
                     local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
                         forward_batch.extend_seq_lens_cpu,
                         keep_zeros=True,
@@ -1033,62 +1064,26 @@ class AscendAttnBackend(AttentionBackend):
             (forward_batch.forward_mode.is_decode() and use_nsa_dsv4_pa_decode())
             or (
                 forward_batch.forward_mode.is_prefill()
-                and use_nsa_dsv4_pa_prefill()
+                and effective_use_nsa_dsv4_pa_prefill(forward_batch)
             )
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
+        if (
+            self.is_dsv4
+            and get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False")
+            and _dsv4_debug_rank0()
+        ):
+            logger.warning(
+                "DSV4 NPU metadata gate: mode=%s need_meta=%s cp_rr=%s "
+                "cp_meta=%s ext_lens=%s",
+                forward_batch.forward_mode,
+                need_dsv4_kernel_metadata,
+                can_nsa_prefill_cp_round_robin_split(forward_batch),
+                getattr(forward_batch, "nsa_cp_metadata", None) is not None,
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+            )
         if need_dsv4_kernel_metadata:
-            if get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False"):
-                out_cache_loc = forward_batch.out_cache_loc_dsv4
-                logger.warning(
-                    "DSV4 NPU forward metadata state: "
-                    "mode=%s, batch_size=%s, seq_lens_cpu=%s, "
-                    "seq_lens=%s, extend_seq_lens_cpu=%s, req_pool_indices=%s, "
-                    "swa_loc=%s, c4_loc=%s, c128_loc=%s, c4_state_loc=%s, "
-                    "actual_q=%s, actual_q_pa=%s, actual_kv=%s, "
-                    "swa_page_table=%s, c4_page_table=%s, c128_page_table=%s",
-                    forward_batch.forward_mode,
-                    forward_batch.batch_size,
-                    getattr(forward_batch, "seq_lens_cpu", None),
-                    self._debug_tensor_brief(getattr(forward_batch, "seq_lens", None)),
-                    getattr(forward_batch, "extend_seq_lens_cpu", None),
-                    self._debug_tensor_brief(
-                        getattr(forward_batch, "req_pool_indices", None)
-                    ),
-                    self._debug_tensor_brief(
-                        getattr(out_cache_loc, "out_swa_loc", None)
-                        if out_cache_loc is not None
-                        else None
-                    ),
-                    self._debug_tensor_brief(
-                        getattr(out_cache_loc, "out_c4_loc", None)
-                        if out_cache_loc is not None
-                        else None
-                    ),
-                    self._debug_tensor_brief(
-                        getattr(out_cache_loc, "out_c128_loc", None)
-                        if out_cache_loc is not None
-                        else None
-                    ),
-                    self._debug_tensor_brief(
-                        getattr(out_cache_loc, "out_c4_state_loc", None)
-                        if out_cache_loc is not None
-                        else None
-                    ),
-                    self._debug_tensor_brief(
-                        self.forward_metadata.actual_seq_lengths_q
-                    ),
-                    self._debug_tensor_brief(
-                        self.forward_metadata.actual_seq_lengths_q_pa
-                    ),
-                    self._debug_tensor_brief(
-                        self.forward_metadata.actual_seq_lengths_kv
-                    ),
-                    self._debug_tensor_brief(self.forward_metadata.swa_page_table),
-                    self._debug_tensor_brief(self.forward_metadata.c4_page_table),
-                    self._debug_tensor_brief(self.forward_metadata.c128_page_table),
-                )
             self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
                 forward_batch.batch_size,
                 self.forward_metadata,
@@ -1794,12 +1789,40 @@ class AscendAttnBackend(AttentionBackend):
                 skip_pa_prefill_sharedkv = get_bool_env_var(
                     "SGLANG_DSV4_NPU_SKIP_PA_PREFILL_SHAREDKV", "False"
                 )
-                use_pa_prefill = (
-                    use_nsa_dsv4_pa_prefill() and not skip_pa_prefill_sharedkv
+                effective_pa_prefill = effective_use_nsa_dsv4_pa_prefill(
+                    forward_batch
                 )
+                use_pa_prefill = effective_pa_prefill and not skip_pa_prefill_sharedkv
+                sync_debug = get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False")
+                if sync_debug and _dsv4_debug_rank0():
+                    logger.warning(
+                        "DSV4 NPU prefill PA gate: layer=%s, raw_pa=%s, "
+                        "effective_pa=%s, use_pa=%s, cp_rr=%s, rr_mode=%s, "
+                        "nsa_cp=%s, cp_size=%s, total_len=%s, mode=%s, "
+                        "mode_prefill=%s, mode_extend=%s, cp_meta=%s, "
+                        "seq_lens_cpu=%s, ext_lens=%s, q_shape=%s, k_shape=%s",
+                        layer.layer_id,
+                        use_nsa_dsv4_pa_prefill(),
+                        effective_pa_prefill,
+                        use_pa_prefill,
+                        can_nsa_prefill_cp_round_robin_split(forward_batch),
+                        is_nsa_prefill_cp_round_robin_split(),
+                        is_nsa_enable_prefill_cp(),
+                        get_nsa_prefill_cp_size(),
+                        get_nsa_prefill_cp_total_len(forward_batch),
+                        forward_batch.forward_mode,
+                        forward_batch.forward_mode.is_prefill(),
+                        forward_batch.forward_mode.is_extend(),
+                        getattr(forward_batch, "nsa_cp_metadata", None) is not None,
+                        getattr(forward_batch, "seq_lens_cpu", None),
+                        getattr(forward_batch, "extend_seq_lens_cpu", None),
+                        tuple(q.shape),
+                        tuple(k.shape) if hasattr(k, "shape") else type(k).__name__,
+                    )
                 if (
                     skip_pa_prefill_sharedkv
-                    and get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False")
+                    and sync_debug
+                    and _dsv4_debug_rank0()
                 ):
                     logger.warning(
                         "DSV4 NPU sync debug skip PA prefill sharedkv: "
@@ -1898,7 +1921,7 @@ class AscendAttnBackend(AttentionBackend):
                         }
                         attn_kwargs = attn_kwargs | c_kwargs
 
-                    if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
+                    if sync_debug and _dsv4_debug_rank0():
                         logger.warning(
                             "DSV4 NPU sync debug before PA prefill sharedkv: "
                             "layer=%s, compress_ratio=%s, has_compress_kv=%s, "
@@ -1918,31 +1941,42 @@ class AscendAttnBackend(AttentionBackend):
                             self._debug_tensor_brief(topk_indices_for_cmp),
                         )
                     o, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
-                    if get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False"):
-                        logger.warning(
-                            "DSV4 NPU sync debug after PA prefill sharedkv before synchronize: "
-                            "layer=%s, compress_ratio=%s",
-                            layer.layer_id,
-                            compress_ratio,
-                        )
+                    if sync_debug:
                         torch.npu.synchronize()
-                        logger.warning(
-                            "DSV4 NPU sync debug after PA prefill sharedkv synchronized: "
-                            "layer=%s, compress_ratio=%s",
-                            layer.layer_id,
-                            compress_ratio,
-                        )
+                        if _dsv4_debug_rank0():
+                            logger.warning(
+                                "DSV4 NPU sync debug after PA prefill sharedkv synchronized: "
+                                "layer=%s, compress_ratio=%s",
+                                layer.layer_id,
+                                compress_ratio,
+                            )
                 else:
-                    split_seq = forward_batch.seq_lens_cpu
-                    split_seq = split_seq.tolist()
+                    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                        # In round-robin CP prefill the model has already gathered
+                        # K/V back to the full sequence, while Q remains local to
+                        # this rank.  The non-PA attention loop therefore splits
+                        # K by global sequence length and Q/topk by local Q length.
+                        split_seq = [get_nsa_prefill_cp_total_len(forward_batch)]
+                    else:
+                        split_seq = forward_batch.seq_lens_cpu.tolist()
 
                     if isinstance(k, (list, tuple)):
                         k_list = k
                     else:
                         k_list = k.split(split_seq, dim=0)
                     o = q.new_empty(q.shape)
-                    q_list = q.split(split_seq, dim=0)
-                    topk_indices_list = topk_indices.split(split_seq, dim=0)
+                    # In CP round-robin prefill, Q and topk_indices contain only
+                    # the local rank's token subset, while K is globally gathered
+                    # (after rebuild_cp_kv_cache).  Split Q/topk by local per-seq
+                    # Q counts; K is still split by the full global seq lengths.
+                    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                        local_q_split, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+                            split_seq, keep_zeros=False
+                        )
+                    else:
+                        local_q_split = split_seq
+                    q_list = q.split(local_q_split, dim=0)
+                    topk_indices_list = topk_indices.split(local_q_split, dim=0)
 
                     offset = 0
                     for q_i, k_i, topk_indices_i in zip(
