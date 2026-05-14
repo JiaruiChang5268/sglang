@@ -46,7 +46,12 @@ def use_nsa_dsv4_pa_prefill():
 def effective_use_nsa_dsv4_pa_prefill(forward_batch: "ForwardBatch"):
     if not use_nsa_dsv4_pa_prefill():
         return False
-    return not can_nsa_prefill_cp_round_robin_split(forward_batch)
+    if (
+        can_nsa_prefill_cp_round_robin_split(forward_batch)
+        and get_bool_env_var("SGLANG_DSV4_NPU_FORCE_NON_PA_PREFILL_CP", "False")
+    ):
+        return False
+    return True
 
 
 def use_nsa_dsv4_pa_decode():

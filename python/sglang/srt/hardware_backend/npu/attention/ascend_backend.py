@@ -45,7 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     OutCacheLoc,
 )
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -308,6 +308,9 @@ class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
+        self.dsv4_prefill_decode_kernel_metadata = None
+        self.dsv4_prefill_decode_kernel_metadata_batch_size = None
+        self.dsv4_prefill_decode_kernel_metadata_max_seqlen_kv = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
         self.speculative_step_offset = speculative_step_id + 1
@@ -510,6 +513,8 @@ class AscendAttnBackend(AttentionBackend):
             "num_heads_q": q_head_num,
             "num_heads_kv": kv_head_num,
             "head_dim": self.config.head_dim,  # TODO: qzd
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_kv": max_seqlen_kv,
             "has_ori_kv": True,
             "has_cmp_kv": False,  # True, False; False means no compressor kv cache
         }
@@ -641,6 +646,96 @@ class AscendAttnBackend(AttentionBackend):
             )
             kernel_metadata.update({"li_quant_metadata": li_quant_metadata})
         return kernel_metadata
+
+    def _clone_kernel_metadata(self, kernel_metadata):
+        return {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in kernel_metadata.items()
+        }
+
+    def _padded_max_seqlen_kv(self, forward_metadata: ForwardMetadata) -> int:
+        if (
+            forward_metadata.actual_seq_lengths_kv is None
+            or forward_metadata.actual_seq_lengths_kv.numel() == 0
+        ):
+            return 0
+        max_seqlen_kv_actual = int(forward_metadata.actual_seq_lengths_kv.max().item())
+        if max_seqlen_kv_actual == 0:
+            return 0
+        return (
+            (max_seqlen_kv_actual + self.page_size - 1) // self.page_size
+        ) * self.page_size
+
+    def _decode_metadata_cache_max_seqlen_kv(
+        self, forward_batch: ForwardBatch, forward_metadata: ForwardMetadata
+    ) -> int:
+        current = self._padded_max_seqlen_kv(forward_metadata)
+        target = current
+        sampling_info = getattr(forward_batch, "sampling_info", None)
+        max_new_tokens = getattr(sampling_info, "max_new_tokens", None)
+        if max_new_tokens is not None and forward_batch.seq_lens_cpu is not None:
+            target_lens = forward_batch.seq_lens_cpu.to(
+                device=max_new_tokens.device, dtype=max_new_tokens.dtype
+            ) + max_new_tokens
+            if target_lens.numel() > 0:
+                target = max(target, int(target_lens.max().item()))
+
+        configured = get_int_env_var(
+            "SGLANG_DSV4_NPU_DECODE_METADATA_MAX_SEQLEN_KV", 0
+        )
+        if configured > 0:
+            target = max(target, configured)
+
+        target = max(target, self.page_size)
+        target = min(target, self.max_context_len)
+        return ((target + self.page_size - 1) // self.page_size) * self.page_size
+
+    def compute_decode_shape_kernel_metadata(
+        self,
+        batch_size: int,
+        forward_metadata: ForwardMetadata,
+        max_seqlen_kv: Optional[int] = None,
+    ):
+        saved_actual_q = forward_metadata.actual_seq_lengths_q
+        saved_actual_q_pa = forward_metadata.actual_seq_lengths_q_pa
+        saved_actual_q_cmp = forward_metadata.actual_seq_lengths_q_cmp
+        saved_actual_kv = forward_metadata.actual_seq_lengths_kv
+        q_device = (
+            forward_metadata.actual_seq_lengths_q_pa.device
+            if forward_metadata.actual_seq_lengths_q_pa is not None
+            else "npu"
+        )
+        try:
+            forward_metadata.actual_seq_lengths_q = torch.arange(
+                1, batch_size + 1, device=q_device, dtype=torch.int32
+            )
+            forward_metadata.actual_seq_lengths_q_pa = torch.arange(
+                0, batch_size + 1, device=q_device, dtype=torch.int32
+            )
+            forward_metadata.actual_seq_lengths_q_cmp = (
+                forward_metadata.actual_seq_lengths_q_pa.clone()
+            )
+            if max_seqlen_kv is not None:
+                kv_device = (
+                    saved_actual_kv.device if saved_actual_kv is not None else q_device
+                )
+                forward_metadata.actual_seq_lengths_kv = torch.full(
+                    (batch_size,),
+                    max_seqlen_kv,
+                    device=kv_device,
+                    dtype=torch.int32,
+                )
+            return self.compute_kernel_metadata(
+                batch_size,
+                forward_metadata,
+                max_seqlen_q=1,
+                is_nextn=self.is_dsv4_nextn,
+            )
+        finally:
+            forward_metadata.actual_seq_lengths_q = saved_actual_q
+            forward_metadata.actual_seq_lengths_q_pa = saved_actual_q_pa
+            forward_metadata.actual_seq_lengths_q_cmp = saved_actual_q_cmp
+            forward_metadata.actual_seq_lengths_kv = saved_actual_kv
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -1069,11 +1164,12 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
-        if (
+        metadata_debug_rank0 = (
             self.is_dsv4
             and get_bool_env_var("SGLANG_DSV4_NPU_METADATA_DEBUG", "False")
             and _dsv4_debug_rank0()
-        ):
+        )
+        if metadata_debug_rank0:
             logger.warning(
                 "DSV4 NPU metadata gate: mode=%s need_meta=%s cp_rr=%s "
                 "cp_meta=%s ext_lens=%s",
@@ -1083,13 +1179,75 @@ class AscendAttnBackend(AttentionBackend):
                 getattr(forward_batch, "nsa_cp_metadata", None) is not None,
                 getattr(forward_batch, "extend_seq_lens_cpu", None),
             )
-        if need_dsv4_kernel_metadata:
-            self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
-                forward_batch.batch_size,
-                self.forward_metadata,
-                max_seqlen_q,
-                is_nextn=self.is_dsv4_nextn,
+        should_cache_prefill_decode_metadata = (
+            self.is_dsv4
+            and forward_batch.forward_mode.is_prefill()
+            and effective_use_nsa_dsv4_pa_prefill(forward_batch)
+            and use_nsa_dsv4_pa_decode()
+            and can_nsa_prefill_cp_round_robin_split(forward_batch)
+            and get_bool_env_var(
+                "SGLANG_DSV4_NPU_REUSE_PREFILL_DECODE_METADATA", "True"
             )
+        )
+        if should_cache_prefill_decode_metadata:
+            decode_metadata_max_seqlen_kv = (
+                self._decode_metadata_cache_max_seqlen_kv(
+                    forward_batch, self.forward_metadata
+                )
+            )
+            self.dsv4_prefill_decode_kernel_metadata = self._clone_kernel_metadata(
+                self.compute_decode_shape_kernel_metadata(
+                    forward_batch.batch_size,
+                    self.forward_metadata,
+                    max_seqlen_kv=decode_metadata_max_seqlen_kv,
+                )
+            )
+            self.dsv4_prefill_decode_kernel_metadata_batch_size = (
+                forward_batch.batch_size
+            )
+            self.dsv4_prefill_decode_kernel_metadata_max_seqlen_kv = (
+                decode_metadata_max_seqlen_kv
+            )
+            if metadata_debug_rank0:
+                logger.warning(
+                    "DSV4 NPU cached prefill decode-shape metadata: "
+                    "batch_size=%s, max_seqlen_kv=%s",
+                    self.dsv4_prefill_decode_kernel_metadata_batch_size,
+                    self.dsv4_prefill_decode_kernel_metadata_max_seqlen_kv,
+                )
+
+        if need_dsv4_kernel_metadata:
+            can_reuse_prefill_decode_metadata = (
+                self.is_dsv4
+                and forward_batch.forward_mode.is_decode()
+                and use_nsa_dsv4_pa_decode()
+                and get_bool_env_var(
+                    "SGLANG_DSV4_NPU_REUSE_PREFILL_DECODE_METADATA", "True"
+                )
+                and self.dsv4_prefill_decode_kernel_metadata is not None
+                and self.dsv4_prefill_decode_kernel_metadata_batch_size
+                == forward_batch.batch_size
+                and self._padded_max_seqlen_kv(self.forward_metadata)
+                <= self.dsv4_prefill_decode_kernel_metadata_max_seqlen_kv
+            )
+            if can_reuse_prefill_decode_metadata:
+                self.forward_metadata.kernel_metadata = self._clone_kernel_metadata(
+                    self.dsv4_prefill_decode_kernel_metadata
+                )
+                if metadata_debug_rank0:
+                    logger.warning(
+                        "DSV4 NPU reused prefill decode-shape metadata: "
+                        "batch_size=%s, max_seqlen_kv=%s",
+                        forward_batch.batch_size,
+                        self._padded_max_seqlen_kv(self.forward_metadata),
+                    )
+            else:
+                self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
+                    forward_batch.batch_size,
+                    self.forward_metadata,
+                    max_seqlen_q,
+                    is_nextn=self.is_dsv4_nextn,
+                )
 
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
@@ -1842,17 +2000,25 @@ class AscendAttnBackend(AttentionBackend):
                     topk_indices_for_cmp = topk_indices
                     effective_has_compress_kv = has_compress_kv
                     if compress_ratio == 4 and has_compress_kv:
-                        topk_indices_for_cmp = topk_indices.view(
-                            -1, 1, topk_indices.shape[-1]
-                        )
-                        topk_valid_count = int((topk_indices_for_cmp >= 0).sum().item())
-                        effective_has_compress_kv = topk_valid_count > 0
+                        if topk_indices is None:
+                            effective_has_compress_kv = False
+                        else:
+                            topk_indices_for_cmp = topk_indices.view(
+                                -1, 1, topk_indices.shape[-1]
+                            )
+                            topk_valid_count = int(
+                                (topk_indices_for_cmp >= 0).sum().item()
+                            )
+                            effective_has_compress_kv = topk_valid_count > 0
                     metadata = self.forward_metadata.kernel_metadata[
                         f"c{compress_ratio}a_metadata"
                         if effective_has_compress_kv
                         else "c1a_metadata"
                     ]
-                    q = q.squeeze(0)
+                    if q.dim() == 4 and q.shape[0] == 1:
+                        q = q.squeeze(0)
+                    if q.shape[0] == 0:
+                        return q.new_empty(q.shape)
                     if is_nsa_enable_prefill_cp():
                         seq_lens_tensor = torch.tensor(
                             forward_batch.seq_lens_cpu,
@@ -1985,7 +2151,9 @@ class AscendAttnBackend(AttentionBackend):
                         q_i = q_i.unsqueeze(0)  # BSND
                         k_i = k_i.view(1, k_i.shape[0], k_i.shape[-1])  # T1D --> BSD
                         topk_indices_i = topk_indices_i.unsqueeze(0)  # [1, S_q, K]
-                        if compress_ratio > 1:
+                        if compress_ratio > 1 and not can_nsa_prefill_cp_round_robin_split(
+                            forward_batch
+                        ):
                             # topk_indices_i holds C4-block indices (range [0, S_k//ratio)),
                             # but dsv4_sparse_attn builds an index_mask of size S_k+1 and
                             # scatters them as token-level positions.  Without expansion,

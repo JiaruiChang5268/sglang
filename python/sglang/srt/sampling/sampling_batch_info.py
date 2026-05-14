@@ -26,6 +26,7 @@ class SamplingBatchInfo:
     top_ps: torch.Tensor
     top_ks: torch.Tensor
     min_ps: torch.Tensor
+    max_new_tokens: torch.Tensor
 
     # Whether all requests use greedy sampling
     is_all_greedy: bool
@@ -90,6 +91,11 @@ class SamplingBatchInfo:
         )
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
+        )
+        max_new_tokens = torch.tensor(
+            [r.sampling_params.max_new_tokens for r in reqs],
+            dtype=torch.int32,
+            device=device,
         )
         sampling_seed = (
             torch.tensor(
@@ -172,6 +178,7 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            max_new_tokens=max_new_tokens,
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
@@ -279,6 +286,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "max_new_tokens",
             "sampling_seed",
         ]:
             value = getattr(self, item, None)
@@ -387,6 +395,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "max_new_tokens",
             "sampling_seed",
         ]:
             self_val = getattr(self, item, None)
