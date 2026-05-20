@@ -190,6 +190,23 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
+        # DP-attention IDLE ranks get a padded batch (bs>0) but seq_lens are
+        # all zero. The sparse-attn metadata kernel
+        # (npu_sparse_attn_sharedkv_metadata) doesn't accept this shape; even
+        # after clamping seqused_kv it tries to read the request's page table
+        # at positions that were never written, which surfaces as an AICPU
+        # exception (errcode 0x2a / runtime 507018) on the next sync.
+        # The rest of the V4 backend already treats IDLE as a no-op (see
+        # forward_compress / forward_c4_indexer below), so we mirror that
+        # contract here: stash empty-but-typed defaults on fm so any later
+        # attribute access stays well-defined, then return without invoking
+        # any sparse-attn metadata kernels.
+        if forward_batch.forward_mode.is_idle():
+            fm.actual_seq_lengths_q = None
+            fm.actual_seq_lengths_q_pa = None
+            fm.kernel_metadata = {}
+            return
+
         # Build TND cu_seqlens_q (= cumulative QUERY seq lens, int32 device tensor).
         # The kernel uses cu_seqlens_q to slice the q tensor by request, so
         # the per-request length here must equal the per-request token count
@@ -498,6 +515,17 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 1, 4, 128); got {compress_ratio}"
             )
+        # IDLE rank short-circuit: DP-attention pads idle ranks (bs>0,
+        # seq_lens all zero) so collective ops stay synchronized. The output
+        # is thrown away by the DP allreduce, but if we still execute the
+        # NPU sparse-attn / store_cache kernels the AICPU path bombs out
+        # (kernelName=SparseAttnSharedkvMetadata, errcode 0x2a) the next
+        # time a sync point is reached. Mirror the pattern used by
+        # forward_compress / forward_c4_indexer above: skip every NPU custom
+        # op for idle and return zeros of the expected attention-output
+        # shape so the rest of model.forward can run for collective sync.
+        if forward_batch.forward_mode.is_idle():
+            return torch.zeros_like(q)
         # Honor save_kv_cache=True contract. With SGLANG_OPT_USE_OVERLAP_STORE_CACHE
         # default TRUE, MQALayer._forward_prepare already writes K via store_cache
         # and passes save_kv_cache=False here (no dup-write). With overlap=False,
