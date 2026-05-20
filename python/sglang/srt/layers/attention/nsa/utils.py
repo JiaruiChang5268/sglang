@@ -86,6 +86,16 @@ def get_nsa_prefill_cp_size():
 
 
 def get_nsa_prefill_cp_total_len(forward_batch: "ForwardBatch"):
+    if (
+        is_nsa_prefill_cp_round_robin_split()
+        and forward_batch.forward_mode.is_prefill()
+    ):
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu is not None:
+            if isinstance(extend_seq_lens_cpu, torch.Tensor):
+                return int(extend_seq_lens_cpu.sum().item())
+            return int(sum(extend_seq_lens_cpu))
+
     global_num_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
     if global_num_tokens is None:
         global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)

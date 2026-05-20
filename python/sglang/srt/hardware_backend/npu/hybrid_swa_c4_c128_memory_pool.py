@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LastLoc,
     OutCacheLoc,
 )
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -362,6 +363,24 @@ class SWAC4C128KVPool(KVCache):
         cache: torch.Tensor,
         scale: float = 1.0,
     ):
+        if loc.numel() != cache.shape[0]:
+            if cache.shape[0] < loc.numel():
+                raise RuntimeError(
+                    "DSV4 NPU SWA cache rows are fewer than locs: "
+                    f"layer={layer.layer_id}, loc={loc.numel()}, "
+                    f"cache={cache.shape[0]}"
+                )
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DSV4 NPU trim padded SWA cache rows in pool: "
+                    "layer=%s, loc=%s, cache=%s",
+                    layer.layer_id,
+                    loc.numel(),
+                    cache.shape[0],
+                )
+            cache = cache[: loc.numel()]
+            if isinstance(scale, torch.Tensor) and scale.shape[0] > loc.numel():
+                scale = scale[: loc.numel()]
         self.swa_kv_pool.set_kv_buffer(layer, loc, cache, scale)
 
     def set_compress_buffer(

@@ -91,6 +91,36 @@ def _dsv4_debug_rank0() -> bool:
     return get_attention_tp_rank() == 0
 
 
+def _dsv4_compress_debug() -> bool:
+    return get_bool_env_var(
+        "SGLANG_DSV4_NPU_COMPRESS_DEBUG", "False"
+    ) or get_bool_env_var("SGLANG_DSV4_NPU_SYNC_DEBUG", "False")
+
+
+def _debug_tensor_brief(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    ret = {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+    try:
+        if tensor.numel() <= 64:
+            ret["values"] = tensor.detach().cpu().tolist()
+        else:
+            ret["first"] = tensor.flatten()[:8].detach().cpu().tolist()
+            ret["last"] = tensor.flatten()[-8:].detach().cpu().tolist()
+            ret["numel"] = tensor.numel()
+    except Exception as e:
+        ret["error"] = repr(e)
+    return ret
+
+
+def _expected_compress_blocks(seq_lens_cpu, ratio: int) -> int:
+    return sum(int(seq_len) // ratio for seq_len in seq_lens_cpu)
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -263,6 +293,7 @@ class Compressor(nn.Module):
         kv_out_list = []
         kv_state_to_be_cached, score_state_to_be_cached = [], []
         out_cache_loc_list = []
+        compressed_positions_debug = []
         if self.overlap:
             page_table = forward_batch.attn_backend.forward_metadata.c4_state_page_table
         else:
@@ -371,6 +402,8 @@ class Compressor(nn.Module):
             self.rotary_emb(
                 kv[..., -self.rope_head_dim :], None, None, False, positions
             )
+            if is_prefill:
+                compressed_positions_debug.append(positions)
             if self.rotate:
                 # kv = rotate_activation(kv)
                 kv = apply_hadamard(kv, self.hadamard_matrix)
@@ -395,6 +428,41 @@ class Compressor(nn.Module):
             )
         if len(kv_out_list) > 0:
             kv_to_be_cached = torch.cat(kv_out_list, dim=0)
+            if (
+                is_prefill
+                and _dsv4_compress_debug()
+                and can_nsa_prefill_cp_round_robin_split(forward_batch)
+                and _dsv4_debug_rank0()
+            ):
+                loc = (
+                    forward_batch.attn_backend.forward_metadata.c4_loc
+                    if ratio == 4
+                    else forward_batch.attn_backend.forward_metadata.c128_loc
+                )
+                compressed_positions = (
+                    torch.cat(compressed_positions_debug, dim=0)
+                    if len(compressed_positions_debug) > 0
+                    else None
+                )
+                logger.warning(
+                    "DSV4 NPU compressor ori verify: layer=%s, ratio=%s, "
+                    "from_indexer=%s, cp_rank=%s, cp_size=%s, x_shape=%s, "
+                    "positions_shape=%s, seq_lens_cpu=%s, expected_global_blocks=%s, "
+                    "kv_blocks=%s, loc_slots=%s, compressed_positions=%s, loc=%s",
+                    self.layer_id,
+                    ratio,
+                    self.from_indexer,
+                    get_nsa_prefill_cp_rank(),
+                    get_nsa_prefill_cp_size(),
+                    tuple(x.shape),
+                    tuple(positions_bk.shape),
+                    forward_batch.seq_lens_cpu,
+                    _expected_compress_blocks(forward_batch.seq_lens_cpu, ratio),
+                    kv_to_be_cached.shape[0],
+                    loc.numel(),
+                    _debug_tensor_brief(compressed_positions),
+                    _debug_tensor_brief(loc),
+                )
             self.compressor_epilog(kv_to_be_cached, forward_batch)
         if is_prefill and not effective_use_nsa_dsv4_pa_prefill(forward_batch):
             return kv_out_list
@@ -508,6 +576,40 @@ class Compressor(nn.Module):
             loc = forward_batch.attn_backend.forward_metadata.c4_loc
         else:
             loc = forward_batch.attn_backend.forward_metadata.c128_loc
+        kv_blocks_raw = kv.shape[0]
+        if (
+            is_prefill
+            and _dsv4_compress_debug()
+            and can_nsa_prefill_cp_round_robin_split(forward_batch)
+            and _dsv4_debug_rank0()
+        ):
+            logger.warning(
+                "DSV4 NPU compressor fusion verify: layer=%s, ratio=%s, "
+                "from_indexer=%s, cp_rank=%s, cp_size=%s, x_shape=%s, "
+                "positions_shape=%s, seq_lens_cpu=%s, extend_lens=%s, "
+                "cu_seqlens=%s, positions_cmp=%s, start_pos=%s, seqused=%s, "
+                "expected_global_blocks=%s, kv_blocks_raw=%s, loc_slots=%s, "
+                "will_drop=%s, loc=%s, page_table=%s",
+                self.layer_id,
+                ratio,
+                self.from_indexer,
+                get_nsa_prefill_cp_rank(),
+                get_nsa_prefill_cp_size(),
+                tuple(x.shape),
+                tuple(positions.shape),
+                forward_batch.seq_lens_cpu,
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+                _debug_tensor_brief(cu_seqlens),
+                _debug_tensor_brief(positions_cmp),
+                _debug_tensor_brief(start_pos),
+                _debug_tensor_brief(seqused),
+                _expected_compress_blocks(forward_batch.seq_lens_cpu, ratio),
+                kv_blocks_raw,
+                loc.numel(),
+                max(kv_blocks_raw - loc.numel(), 0),
+                _debug_tensor_brief(loc),
+                _debug_tensor_brief(page_table),
+            )
         if is_prefill and loc.numel() < kv.shape[0]:
             if can_nsa_prefill_cp_round_robin_split(forward_batch):
                 # The fused compressor may emit overlap/tail helper blocks.  The
@@ -515,13 +617,13 @@ class Compressor(nn.Module):
                 # use loc as the authoritative write length.
                 kv = kv[: loc.numel()]
             else:
-                if _dsv4_debug_rank0():
-                    logger.warning(
-                        "DSV4 NPU compressor (fusion): c%d loc_slots=%d kv_blocks=%d "
-                        "dropped=%d - c%d_loc is unexpectedly undersized; check CP config",
-                        ratio, loc.numel(), kv.shape[0],
-                        kv.shape[0] - loc.numel(), ratio,
-                    )
+                # if _dsv4_debug_rank0():
+                #     logger.warning(
+                #         "DSV4 NPU compressor (fusion): c%d loc_slots=%d kv_blocks=%d "
+                #         "dropped=%d - c%d_loc is unexpectedly undersized; check CP config",
+                #         ratio, loc.numel(), kv.shape[0],
+                #         kv.shape[0] - loc.numel(), ratio,
+                #     )
                 kv = kv[: loc.numel()]
         elif (
             is_prefill
@@ -560,6 +662,27 @@ class Compressor(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return None
         use_fused_compressor = get_bool_env_var("USE_FUSED_COMPRESSOR")
+        if (
+            _dsv4_compress_debug()
+            and forward_batch.forward_mode.is_prefill()
+            and can_nsa_prefill_cp_round_robin_split(forward_batch)
+            and _dsv4_debug_rank0()
+        ):
+            logger.warning(
+                "DSV4 NPU compressor debug gate: layer=%s, ratio=%s, "
+                "from_indexer=%s, cp_rank=%s, cp_size=%s, use_fused=%s, "
+                "x_shape=%s, positions_shape=%s, seq_lens_cpu=%s, ext_lens=%s",
+                self.layer_id,
+                self.compress_ratio,
+                self.from_indexer,
+                get_nsa_prefill_cp_rank(),
+                get_nsa_prefill_cp_size(),
+                use_fused_compressor,
+                tuple(x.shape),
+                tuple(positions.shape),
+                forward_batch.seq_lens_cpu,
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+            )
         if use_fused_compressor:
             return self.forward_fusion(x, positions, forward_batch)
         else:
@@ -575,6 +698,8 @@ class Compressor(nn.Module):
             loc = forward_batch.attn_backend.forward_metadata.c4_loc
         else:
             loc = forward_batch.attn_backend.forward_metadata.c128_loc
+        kv_rows_before_trim = kv.shape[0]
+        loc_slots = loc.numel()
         if (
             forward_batch.forward_mode.is_prefill()
             and can_nsa_prefill_cp_round_robin_split(forward_batch)
@@ -603,6 +728,35 @@ class Compressor(nn.Module):
             kv = kv[: loc.numel()]
             if kv_scale is not None:
                 kv_scale = kv_scale[: loc.numel()]
+        if (
+            forward_batch.forward_mode.is_prefill()
+            and _dsv4_compress_debug()
+            and can_nsa_prefill_cp_round_robin_split(forward_batch)
+            and _dsv4_debug_rank0()
+        ):
+            logger.warning(
+                "DSV4 NPU compressed KV write verify: layer=%s, ratio=%s, "
+                "from_indexer=%s, cp_rank=%s, cp_size=%s, seq_lens_cpu=%s, "
+                "expected_global_blocks=%s, kv_rows_before_trim=%s, "
+                "kv_rows_after_trim=%s, loc_slots=%s, truncated=%s, "
+                "kv_dtype=%s, kv_scale_shape=%s, loc=%s",
+                self.layer_id,
+                self.compress_ratio,
+                self.from_indexer,
+                get_nsa_prefill_cp_rank(),
+                get_nsa_prefill_cp_size(),
+                forward_batch.seq_lens_cpu,
+                _expected_compress_blocks(
+                    forward_batch.seq_lens_cpu, self.compress_ratio
+                ),
+                kv_rows_before_trim,
+                kv.shape[0],
+                loc_slots,
+                kv_rows_before_trim != kv.shape[0],
+                str(kv.dtype),
+                tuple(kv_scale.shape) if kv_scale is not None else None,
+                _debug_tensor_brief(loc),
+            )
         if kv.shape[0] != loc.numel():
             raise RuntimeError(
                 "DSV4 NPU compressed KV loc mismatch after CP handling: "

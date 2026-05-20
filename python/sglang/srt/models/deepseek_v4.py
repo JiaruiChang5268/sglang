@@ -69,6 +69,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     effective_use_nsa_dsv4_pa_prefill,
+    get_nsa_prefill_cp_rank,
+    get_nsa_prefill_cp_size,
     get_nsa_prefill_cp_total_len,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_round_robin_split,
@@ -186,6 +188,27 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv4_cp_debug_tensor_brief(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    ret = {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+    try:
+        if tensor.numel() <= 64:
+            ret["values"] = tensor.detach().cpu().tolist()
+        else:
+            flat = tensor.flatten()
+            ret["first"] = flat[:8].detach().cpu().tolist()
+            ret["last"] = flat[-8:].detach().cpu().tolist()
+            ret["numel"] = tensor.numel()
+    except Exception as e:
+        ret["error"] = repr(e)
+    return ret
 
 
 def _current_accelerator_stream():
@@ -2029,6 +2052,21 @@ class DeepseekV4AttentionMLA(nn.Module):
                     forward_batch,
                     _current_accelerator_stream(),
                 )
+                expected_kv_len = get_nsa_prefill_cp_total_len(forward_batch)
+                if kv_for_cache.shape[0] > expected_kv_len:
+                    if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                        logger.warning(
+                            "DSV4 NPU CP trim padded KV cache rows: "
+                            "layer=%s, cp_rank=%s, cp_size=%s, "
+                            "kv_rows=%s, expected_rows=%s, ext_lens=%s",
+                            self.layer_id,
+                            get_nsa_prefill_cp_rank(),
+                            get_nsa_prefill_cp_size(),
+                            kv_for_cache.shape[0],
+                            expected_kv_len,
+                            getattr(forward_batch, "extend_seq_lens_cpu", None),
+                        )
+                    kv_for_cache = kv_for_cache[:expected_kv_len]
             forward_batch.token_to_kv_pool.set_swa_buffer(
                 self.attn_mha,
                 metadata.swa_loc,
@@ -2098,10 +2136,34 @@ class DeepseekV4AttentionMLA(nn.Module):
                         kv_pad = kv_list
             kv = kv_pad
         else:
+            metadata = forward_batch.attn_backend.forward_metadata
+            swa_loc = metadata.swa_loc
+            num_cache_tokens = swa_loc.numel()
+            kv_for_cache = kv
+            if kv_for_cache.shape[0] != num_cache_tokens:
+                if kv_for_cache.shape[0] < num_cache_tokens:
+                    raise RuntimeError(
+                        "DSV4 NPU decode KV cache rows are fewer than cache locs: "
+                        f"layer={self.layer_id}, kv_rows={kv_for_cache.shape[0]}, "
+                        f"swa_loc={num_cache_tokens}"
+                    )
+                if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                    logger.warning(
+                        "DSV4 NPU trim padded decode cache rows: "
+                        "layer=%s, kv_rows=%s, cache_rows=%s, "
+                        "x_rows=%s, positions_rows=%s, mode=%s",
+                        self.layer_id,
+                        kv_for_cache.shape[0],
+                        num_cache_tokens,
+                        x.shape[0],
+                        positions.shape[0],
+                        forward_batch.forward_mode,
+                    )
+                kv_for_cache = kv_for_cache[:num_cache_tokens]
             forward_batch.token_to_kv_pool.set_swa_buffer(
                 self.attn_mha,
-                forward_batch.attn_backend.forward_metadata.swa_loc,
-                kv,
+                swa_loc,
+                kv_for_cache,
                 None,
             )
             if self.compress_ratio > 1:
@@ -3185,10 +3247,68 @@ class DeepseekV4Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if nsa_use_prefill_cp(forward_batch):
+        cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+        use_prefill_cp = nsa_use_prefill_cp(forward_batch)
+        if cp_verify:
+            logger.warning(
+                "DSV4 NPU CP gate verify: use_prefill_cp=%s, "
+                "enable_cp=%s, rr_mode=%s, can_rr=%s, cp_rank=%s, cp_size=%s, "
+                "mode=%s, mode_prefill=%s, mode_context_extend=%s, "
+                "ext_lens=%s, total_len=%s, nsa_cp_metadata=%s, "
+                "input_ids_shape=%s, positions=%s",
+                use_prefill_cp,
+                is_nsa_enable_prefill_cp(),
+                is_nsa_prefill_cp_round_robin_split(),
+                can_nsa_prefill_cp_round_robin_split(forward_batch),
+                get_nsa_prefill_cp_rank(),
+                get_nsa_prefill_cp_size(),
+                forward_batch.forward_mode,
+                forward_batch.forward_mode.is_prefill(),
+                forward_batch.forward_mode.is_context_parallel_extend(),
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+                get_nsa_prefill_cp_total_len(forward_batch),
+                getattr(forward_batch, "nsa_cp_metadata", None) is not None,
+                tuple(input_ids.shape) if input_ids is not None else None,
+                _dsv4_cp_debug_tensor_brief(positions),
+            )
+        if use_prefill_cp:
+            cp_positions_before = positions
+            cp_hidden_shape_before = tuple(hidden_states.shape)
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if cp_verify:
+                cp_rank = get_nsa_prefill_cp_rank()
+                cp_size = get_nsa_prefill_cp_size()
+                expected_positions = None
+                positions_match = None
+                if can_nsa_prefill_cp_round_robin_split(forward_batch):
+                    expected_positions = cp_positions_before[cp_rank::cp_size]
+                    positions_match = (
+                        positions.shape == expected_positions.shape
+                        and torch.equal(positions, expected_positions)
+                    )
+                logger.warning(
+                    "DSV4 NPU CP split verify: cp_rank=%s, cp_size=%s, "
+                    "rr_mode=%s, can_rr=%s, mode=%s, ext_lens=%s, "
+                    "total_len=%s, hidden_before_shape=%s, "
+                    "hidden_after_shape=%s, positions_before=%s, "
+                    "positions_after=%s, expected_positions=%s, "
+                    "positions_match=%s",
+                    cp_rank,
+                    cp_size,
+                    is_nsa_prefill_cp_round_robin_split(),
+                    can_nsa_prefill_cp_round_robin_split(forward_batch),
+                    forward_batch.forward_mode,
+                    getattr(forward_batch, "extend_seq_lens_cpu", None),
+                    get_nsa_prefill_cp_total_len(forward_batch),
+                    cp_hidden_shape_before,
+                    tuple(hidden_states.shape),
+                    _dsv4_cp_debug_tensor_brief(cp_positions_before),
+                    _dsv4_cp_debug_tensor_brief(positions),
+                    _dsv4_cp_debug_tensor_brief(expected_positions),
+                    positions_match,
+                )
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
@@ -3262,12 +3382,26 @@ class DeepseekV4Model(nn.Module):
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
+            cp_output_shape_before = tuple(hidden_states.shape)
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 _current_accelerator_stream(),
             )
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DSV4 NPU CP allgather verify: cp_rank=%s, cp_size=%s, "
+                    "mode=%s, ext_lens=%s, total_len=%s, "
+                    "local_output_shape=%s, gathered_output_shape=%s",
+                    get_nsa_prefill_cp_rank(),
+                    get_nsa_prefill_cp_size(),
+                    forward_batch.forward_mode,
+                    getattr(forward_batch, "extend_seq_lens_cpu", None),
+                    get_nsa_prefill_cp_total_len(forward_batch),
+                    cp_output_shape_before,
+                    tuple(hidden_states.shape),
+                )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states

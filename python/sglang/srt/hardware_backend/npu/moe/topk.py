@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -9,6 +10,8 @@ from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physica
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -32,6 +35,31 @@ def fused_topk_npu(
     scoring_func = topk_config.scoring_func
     routed_scaling_factor = topk_config.routed_scaling_factor
     is_hash_layer = topk_config.is_hash_layer
+    if input_ids is not None:
+        input_ids = input_ids.reshape(-1)
+        expected_tokens = router_logits.shape[0]
+        if input_ids.numel() != expected_tokens:
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DSV4 NPU align MOE topk input_ids with router logits: "
+                    "layer=%s, input_ids=%s, router_rows=%s, "
+                    "hidden_rows=%s, num_token_non_padded=%s",
+                    layer_id,
+                    input_ids.numel(),
+                    expected_tokens,
+                    hidden_states.shape[0],
+                    num_token_non_padded,
+                )
+            if input_ids.numel() < expected_tokens:
+                input_ids = torch.cat(
+                    [
+                        input_ids,
+                        input_ids.new_zeros(expected_tokens - input_ids.numel()),
+                    ],
+                    dim=0,
+                )
+            else:
+                input_ids = input_ids[:expected_tokens]
 
     use_npu_moe_gating_top_k = get_bool_env_var("USE_NPU_MOE_GATING_TOP_K")
     if use_npu_moe_gating_top_k and (is_hash_layer or scoring_func == "sqrtsoftplus"):
