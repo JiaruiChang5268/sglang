@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import ceil_div, is_npu
+from sglang.srt.utils import ceil_div, get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 
@@ -927,6 +927,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Caller (V4 MQALayer) hands us cache shaped (T, dim) — the kv tensor
         # before it splits heads. The buffer has an explicit num_kv_heads=1
         # axis, so insert it.
+        num_locs = loc.numel()
+        if cache.shape[0] != num_locs:
+            if cache.shape[0] < num_locs:
+                raise RuntimeError(
+                    "DeepSeekV4 SWA cache rows are fewer than cache locs: "
+                    f"layer_id={layer_id}, cache_rows={cache.shape[0]}, "
+                    f"loc_rows={num_locs}"
+                )
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DeepSeekV4 trims padded SWA cache rows before write: "
+                    "layer_id=%s, cache_rows=%s, loc_rows=%s",
+                    layer_id,
+                    cache.shape[0],
+                    num_locs,
+                )
+            cache = cache[:num_locs]
         if cache.ndim == buf_flat.ndim - 1:
             cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)

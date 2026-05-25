@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -21,16 +22,24 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_cp_size
+from sglang.srt.layers.attention.nsa.utils import (
+    get_nsa_prefill_cp_size,
+    nsa_use_prefill_cp,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_current_device_stream_fast,
+    is_npu,
+)
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -417,9 +426,9 @@ class Compressor(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
-                get_attention_cp_size(),
+                get_nsa_prefill_cp_size(),
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
             )
 
         backend = forward_batch.attn_backend
@@ -768,6 +777,29 @@ class Compressor(nn.Module):
         else:
             backend_fm = forward_batch.attn_backend.forward_metadata
             loc = backend_fm.c4_loc if self.ratio == 4 else backend_fm.c128_loc
+        num_locs = loc.numel()
+        if kv.shape[0] != num_locs:
+            if kv.shape[0] < num_locs:
+                raise RuntimeError(
+                    "DeepSeekV4 compressed KV rows are fewer than cache locs: "
+                    f"layer_id={self.layer_id}, ratio={self.ratio}, "
+                    f"kv_rows={kv.shape[0]}, loc_rows={num_locs}, "
+                    f"is_in_indexer={self.is_in_indexer}"
+                )
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DeepSeekV4 trims padded compressed KV rows before write: "
+                    "layer_id=%s, ratio=%s, kv_rows=%s, loc_rows=%s, "
+                    "is_in_indexer=%s",
+                    self.layer_id,
+                    self.ratio,
+                    kv.shape[0],
+                    num_locs,
+                    self.is_in_indexer,
+                )
+            kv = kv[:num_locs]
+            if kv_scale is not None:
+                kv_scale = kv_scale[:num_locs]
         forward_batch.token_to_kv_pool.set_compress_buffer(
             self.layer_id,
             loc,

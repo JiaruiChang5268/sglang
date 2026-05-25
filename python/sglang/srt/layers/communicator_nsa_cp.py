@@ -20,6 +20,8 @@ import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_data,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
@@ -32,12 +34,11 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
-    attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_attention_cp_group,
-    get_local_dp_buffer,
 )
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import get_current_device_stream_fast
 
 
 def nsa_enable_prefill_cp():
@@ -147,20 +148,22 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         context: CommunicateContext,
         *,
         residual_input_mode,
+        skip_layernorm=False,
     ):
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+        if not skip_layernorm and hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = layernorm(hidden_states, residual)
+            else:
+                hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
-            hidden_states, local_hidden_states = (
-                get_local_dp_buffer(get_attention_cp_group()),
+            hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
-            )
-            attn_cp_all_gather_into_tensor(
-                hidden_states,
-                local_hidden_states,
+                context.attn_cp_size,
+                forward_batch,
+                get_current_device_stream_fast(),
             )
         return hidden_states, residual
 
@@ -207,6 +210,9 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for decode: full -> attn tp full
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
+            if is_nsa_prefill_cp_round_robin_split():
+                hidden_states = nsa_cp_round_robin_split_data(hidden_states)
+                return hidden_states, residual
             input_hidden_states = hidden_states
             hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
                 context.attn_cp_rank

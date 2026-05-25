@@ -11,6 +11,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
@@ -23,6 +24,25 @@ def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
 
 def is_nsa_enable_prefill_cp():
     return get_global_server_args().enable_nsa_prefill_context_parallel
+
+
+def use_nsa_dsv4_pa_prefill():
+    return get_bool_env_var("USE_PA_PREFILL")
+
+
+def effective_use_nsa_dsv4_pa_prefill(forward_batch: "ForwardBatch"):
+    if not use_nsa_dsv4_pa_prefill():
+        return False
+    if (
+        can_nsa_prefill_cp_round_robin_split(forward_batch)
+        and get_bool_env_var("SGLANG_DSV4_NPU_FORCE_NON_PA_PREFILL_CP", "False")
+    ):
+        return False
+    return True
+
+
+def use_nsa_dsv4_pa_decode():
+    return get_bool_env_var("USE_PA_DECODE")
 
 
 def is_nsa_prefill_cp_in_seq_split():
@@ -39,15 +59,40 @@ def is_nsa_prefill_cp_round_robin_split():
     )
 
 
+def get_nsa_prefill_cp_rank():
+    return get_attention_cp_rank()
+
+
+def get_nsa_prefill_cp_size():
+    return get_attention_cp_size()
+
+
+def get_nsa_prefill_cp_total_len(forward_batch: "ForwardBatch"):
+    if (
+        is_nsa_prefill_cp_round_robin_split()
+        and forward_batch.forward_mode.is_prefill()
+    ):
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu is not None:
+            if isinstance(extend_seq_lens_cpu, torch.Tensor):
+                return int(extend_seq_lens_cpu.sum().item())
+            return int(sum(extend_seq_lens_cpu))
+
+    global_num_tokens = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    if global_num_tokens is None:
+        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_num_tokens is not None:
+        if len(global_num_tokens) > 1:
+            return int(global_num_tokens[get_attention_dp_rank()])
+        return int(global_num_tokens[0])
+    return int(sum(forward_batch.extend_seq_lens_cpu))
+
+
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
-        return False
-    cp_size = get_attention_cp_size()
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
+    cp_size = get_nsa_prefill_cp_size()
     return (
         is_nsa_prefill_cp_round_robin_split()
-        and seq_len > 0
-        and seq_len >= cp_size
+        and forward_batch.forward_mode.is_prefill()
         and cp_size > 1
     )
 
@@ -65,11 +110,10 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
     |   +-------------------------+
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
     if isinstance(input_, (tuple, list)):
-        indices = range(cp_rank, len(input_), cp_size)
-        return input_[indices]
+        return input_[cp_rank::cp_size]
 
     tokens = len(input_)
     if tokens % cp_size != 0:
@@ -88,7 +132,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_nsa_prefill_cp_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
@@ -106,7 +150,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
 
 def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
-    attn_cp_size = get_attention_cp_size()
+    attn_cp_size = get_nsa_prefill_cp_size()
     needs_cp_pad = attn_cp_size > 1 and can_nsa_prefill_cp_round_robin_split(
         forward_batch
     )
@@ -127,10 +171,7 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
 
 def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
-        cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        cur_cp_seq_len = ceil_div(seq_len, cp_size)
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -158,6 +199,10 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
     cp_size: tl.constexpr,
     cp_rank: tl.constexpr,
 ):
+    # The batch is treated as one continuous token stream (consistent with
+    # nsa_cp_round_robin_split_data which does input_[cp_rank::cp_size] on
+    # the concatenated sequence).  extra_seq carries the intra-period offset
+    # from one sequence into the next so the global strided split is preserved.
     extra_seq = 0
     bs_idx = 0
     for bs in range(tokens):
@@ -171,16 +216,23 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
         extra_seq = cur_len - cur_seq * cp_size
 
 
-def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs, keep_zeros=False):
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
+    # The batch is treated as one continuous token stream, consistent with
+    # nsa_cp_round_robin_split_data (which does input_[cp_rank::cp_size] on
+    # the full concatenated token list).  extra_seq carries the intra-period
+    # remainder across sequence boundaries so per-sequence counts sum to the
+    # correct global total for this CP rank.
     extra_seq = 0
     q_seqs = []
     for bs, cur_len in enumerate(extend_seqs):
-        cur_len += extra_seq
+        cur_len = int(cur_len) + extra_seq
         cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
         q_seqs.append(cur_seq)
         extra_seq = cur_len - cur_seq * cp_size
+    if keep_zeros:
+        return q_seqs, list(range(len(q_seqs)))
     bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
     q_seqs = [q_len for q_len in q_seqs if q_len > 0]
     return q_seqs, bs_idx
@@ -198,8 +250,8 @@ def nsa_cp_round_robin_split_q_seqs(
     bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
         i.e., those with a partitioned length greater than zero.
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_nsa_prefill_cp_size()
+    cp_rank = get_nsa_prefill_cp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
     ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
@@ -218,9 +270,15 @@ def nsa_cp_round_robin_split_q_seqs(
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+    if not nsa_enable_prefill_cp:
+        return False
+    if is_nsa_prefill_cp_round_robin_split():
+        return (
+            forward_batch.forward_mode.is_prefill()
+            and get_nsa_prefill_cp_size() > 1
+        )
     if (
         forward_batch.attn_cp_metadata is not None
-        and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
         return True

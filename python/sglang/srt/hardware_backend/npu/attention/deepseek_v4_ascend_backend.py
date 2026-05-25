@@ -59,6 +59,13 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
+    get_nsa_prefill_cp_total_len,
+    nsa_cp_round_robin_split_data,
+    nsa_cp_round_robin_split_q_seqs_cpu,
+)
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -75,6 +82,59 @@ def _stub(method_name: str):
         "the NPU port has to either (a) call into torch_npu / ATB / sgl_kernel_npu "
         "for the corresponding fused op, or (b) provide a pure-torch fallback."
     )
+
+
+def _dsv4_prepare_attn_sink(
+    attn_sink: Optional[torch.Tensor],
+    layer_id: int,
+) -> Optional[torch.Tensor]:
+    if attn_sink is None:
+        return None
+
+    cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+    if get_bool_env_var("SGLANG_DSV4_NPU_ZERO_ATTN_SINK", "False"):
+        if cp_verify:
+            logger.warning(
+                "DSV4 NPU uses zeroed attn_sink: layer=%s shape=%s dtype=%s",
+                layer_id,
+                tuple(attn_sink.shape),
+                attn_sink.dtype,
+            )
+        return torch.zeros_like(attn_sink)
+
+    if cp_verify:
+        try:
+            flat = attn_sink.detach().float().reshape(-1)
+            finite = torch.isfinite(flat)
+            finite_count = int(finite.sum().item())
+            if finite_count > 0:
+                finite_flat = flat[finite]
+                min_value = float(finite_flat.min().item())
+                max_value = float(finite_flat.max().item())
+                abs_max = float(finite_flat.abs().max().item())
+            else:
+                min_value = max_value = abs_max = float("nan")
+            sample = flat[: min(6, flat.numel())].cpu().tolist()
+            logger.warning(
+                "DSV4 NPU attn_sink: layer=%s shape=%s dtype=%s "
+                "finite=%s/%s min=%.6e max=%.6e abs_max=%.6e sample=%s",
+                layer_id,
+                tuple(attn_sink.shape),
+                attn_sink.dtype,
+                finite_count,
+                flat.numel(),
+                min_value,
+                max_value,
+                abs_max,
+                sample,
+            )
+        except Exception as exc:
+            logger.warning(
+                "DSV4 NPU attn_sink debug failed: layer=%s error=%s",
+                layer_id,
+                exc,
+            )
+    return attn_sink
 
 
 def _build_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -181,6 +241,18 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
+        self.dsv4_cp_prefill_row_kernel_metadata = {}
+        self._dsv4_cp_verify_init_metadata_logged = False
+        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            logger.warning(
+                "DSV4 NPU CP verify is active: backend=%s, file=%s, "
+                "tp_size=%s, page_size=%s, sliding_window=%s",
+                type(self).__name__,
+                __file__,
+                tp_size,
+                self.page_size,
+                self._dsv4_sliding_window_size,
+            )
 
     # ------------------------------------------------------------------
     # V4-specific metadata + dispatch — all stubbed pending real impls.
@@ -189,6 +261,35 @@ class DeepseekV4AscendAttnBackend(
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
+        self.dsv4_cp_prefill_row_kernel_metadata = {}
+        self.dsv4_cp_prefill_batch_kernel_metadata = {}
+        cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+        if cp_verify and not self._dsv4_cp_verify_init_metadata_logged:
+            from sglang.srt.layers.attention.nsa.utils import (
+                get_nsa_prefill_cp_rank,
+                get_nsa_prefill_cp_size,
+                is_nsa_enable_prefill_cp,
+                is_nsa_prefill_cp_round_robin_split,
+            )
+
+            logger.warning(
+                "DSV4 NPU CP metadata probe: backend=%s, mode=%s, "
+                "is_prefill=%s, nsa_cp=%s, rr=%s, can_rr_split=%s, "
+                "cp_rank=%s, cp_size=%s, batch_size=%s, seq_lens=%s, "
+                "extend_lens=%s",
+                type(self).__name__,
+                forward_batch.forward_mode,
+                forward_batch.forward_mode.is_prefill(),
+                is_nsa_enable_prefill_cp(),
+                is_nsa_prefill_cp_round_robin_split(),
+                can_nsa_prefill_cp_round_robin_split(forward_batch),
+                get_nsa_prefill_cp_rank(),
+                get_nsa_prefill_cp_size(),
+                forward_batch.batch_size,
+                getattr(forward_batch, "seq_lens_cpu", None),
+                getattr(forward_batch, "extend_seq_lens_cpu", None),
+            )
+            self._dsv4_cp_verify_init_metadata_logged = True
 
         # DP-attention IDLE ranks get a padded batch (bs>0) but seq_lens are
         # all zero. The sparse-attn metadata kernel
@@ -264,6 +365,23 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
 
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+                forward_batch.extend_seq_lens_cpu,
+                keep_zeros=True,
+            )
+            local_q_lens = torch.tensor(
+                local_q_lens_cpu,
+                dtype=torch.int32,
+                device=device,
+            )
+            actual_q = local_q_lens.cumsum(0)
+            fm.actual_seq_lengths_q = actual_q
+            fm.actual_seq_lengths_q_pa = torch.cat(
+                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
+                dim=0,
+            )
+
         # SWA page table -- populated by AscendAttnBackend when the model is
         # hybrid-SWA, else None. Aliased under the name forward_sparse uses.
         # Use explicit `is not None` check (not `or`) because
@@ -286,6 +404,8 @@ class DeepseekV4AscendAttnBackend(
         # Build kernel_metadata dict. For V4-Flash we mainly need c1a (no
         # compress KV) right now; c4a/c128a follow when we add those paths.
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
+        self._ensure_cp_prefill_row_kernel_metadata(forward_batch)
+        self._ensure_cp_prefill_batch_kernel_metadata(forward_batch)
 
         # Step-3 NPU compress metadata: only built when forward_npu paths are
         # active (env-gated). Each field is a per-request tensor consumed by
@@ -298,16 +418,59 @@ class DeepseekV4AscendAttnBackend(
         if envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
-    def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
+    def _compute_kernel_metadata(
+        self,
+        forward_batch: "ForwardBatch",
+        *,
+        batch_size: Optional[int] = None,
+        max_seqlen_q: Optional[int] = None,
+        override_max_seqlen_kv: Optional[int] = None,
+    ) -> dict:
         fm = self.forward_metadata
+        if batch_size is None:
+            batch_size = forward_batch.batch_size
         # iforgetmyname Talantan1102/sglang#1: clamp seqused_kv >= 1 so idle
         # ranks (where actual_seq_lengths_kv may contain 0) don't trip
         # sparse-attn metadata with a zero-length entry, which has bitten the
         # NPU kernel in the dpattn + idle-rank workload.
         seqused_kv_safe = fm.actual_seq_lengths_kv.clamp(min=1)
+        max_seqlen_kv = (
+            int(seqused_kv_safe.max().item()) if seqused_kv_safe.numel() > 0 else 0
+        )
+        if max_seqlen_kv > 0:
+            max_seqlen_kv = (
+                (max_seqlen_kv + self.page_size - 1) // self.page_size
+            ) * self.page_size
+        if override_max_seqlen_kv is not None:
+            max_seqlen_kv = max(max_seqlen_kv, int(override_max_seqlen_kv))
+        if max_seqlen_q is None:
+            cu_q = fm.actual_seq_lengths_q_pa
+            if cu_q is not None and cu_q.numel() > 1:
+                max_seqlen_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+            elif fm.actual_seq_lengths_q is not None and fm.actual_seq_lengths_q.numel() > 0:
+                max_seqlen_q = int(fm.actual_seq_lengths_q.max().item())
+            else:
+                max_seqlen_q = 1
+        max_seqlen_q = max(int(max_seqlen_q), 1)
+
+        cu_seqlens_q = fm.actual_seq_lengths_q_pa
+        seqused_kv = seqused_kv_safe
+        if isinstance(cu_seqlens_q, torch.Tensor):
+            cu_seqlens_q = torch.tensor(
+                cu_seqlens_q.detach().cpu().tolist(),
+                dtype=torch.int32,
+                device=cu_seqlens_q.device,
+            )
+        if isinstance(seqused_kv, torch.Tensor):
+            seqused_kv = torch.tensor(
+                seqused_kv.detach().cpu().tolist(),
+                dtype=torch.int32,
+                device=seqused_kv.device,
+            )
+
         common = {
-            "cu_seqlens_q": fm.actual_seq_lengths_q_pa,
-            "seqused_kv": seqused_kv_safe,
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_kv": seqused_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,  # sliding window
             "cmp_mask_mode": 3,  # causal
@@ -317,10 +480,12 @@ class DeepseekV4AscendAttnBackend(
             "layout_kv": "PA_ND",
         }
         base_kwargs = {
-            "batch_size": forward_batch.batch_size,
+            "batch_size": batch_size,
             "num_heads_q": self._dsv4_q_head_num,
             "num_heads_kv": self._dsv4_kv_head_num,
             "head_dim": self._dsv4_head_dim,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_kv": max_seqlen_kv,
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
@@ -337,10 +502,13 @@ class DeepseekV4AscendAttnBackend(
                 "has_cmp_kv": True,
                 "cmp_topk": self._dsv4_index_topk,
             }
-            c4a_kwargs = c1a_kwargs | c4a_overrides
-            kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
-            )
+            if max_seqlen_kv >= 4:
+                c4a_kwargs = c1a_kwargs | c4a_overrides
+                kernel_metadata["c4a_metadata"] = (
+                    torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
+                )
+            else:
+                kernel_metadata["c4a_metadata"] = kernel_metadata["c1a_metadata"]
 
             # The lightning indexer is only attached to c4 layers.
             # Pass actual_seq_lengths_q (no leading 0, B-element cumsum)
@@ -369,12 +537,189 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
-            c128a_kwargs = c1a_kwargs | c128a_overrides
-            kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
-            )
+            if max_seqlen_kv >= 128:
+                c128a_kwargs = c1a_kwargs | c128a_overrides
+                kernel_metadata["c128a_metadata"] = (
+                    torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+                )
+            else:
+                kernel_metadata["c128a_metadata"] = kernel_metadata["c1a_metadata"]
+
+        if self._dsv4_has_c4 and max_seqlen_kv >= 4:
+            _ = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c1a_kwargs)
 
         return kernel_metadata
+
+    def _clone_kernel_metadata(self, kernel_metadata: dict) -> dict:
+        return {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in kernel_metadata.items()
+        }
+
+    def _dsv4_cp_round_robin_local_positions(
+        self,
+        forward_batch: "ForwardBatch",
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        positions = getattr(forward_batch, "positions", None)
+        if positions is not None and positions.numel() > 0:
+            if positions.numel() == num_tokens:
+                local_positions = positions
+            else:
+                local_positions = nsa_cp_round_robin_split_data(positions)
+            if local_positions.numel() >= num_tokens:
+                return local_positions[:num_tokens].to(
+                    device=device,
+                    dtype=torch.int64,
+                )
+
+        # Fallback for metadata-only callers: reconstruct the same round-robin
+        # positions from the local query row count.
+        from sglang.srt.layers.attention.nsa.utils import (
+            get_nsa_prefill_cp_rank,
+            get_nsa_prefill_cp_size,
+        )
+
+        cp_rank = get_nsa_prefill_cp_rank()
+        cp_size = get_nsa_prefill_cp_size()
+        return torch.arange(
+            cp_rank,
+            cp_rank + num_tokens * cp_size,
+            cp_size,
+            device=device,
+            dtype=torch.int64,
+        )
+
+    def _compute_single_query_kernel_metadata(
+        self,
+        forward_batch: "ForwardBatch",
+        seqused_kv: int,
+        global_q_pos: int = 0,
+    ) -> dict:
+        """Build kernel metadata for a single-Q-token batch entry.
+
+        ``global_q_pos`` is the absolute position of this Q token in the full
+        context (0-based).  The single-row kernel call still uses local
+        ``cu_seqlens_q=[0, 1]`` because the q tensor passed to
+        ``npu_sparse_attn_sharedkv`` has exactly one row.  The global causal KV
+        boundary is expressed through ``seqused_kv``.
+        """
+        _ = global_q_pos  # Kept in the signature to document the caller context.
+        fm = self.forward_metadata
+        saved_actual_q = getattr(fm, "actual_seq_lengths_q", None)
+        saved_actual_q_pa = getattr(fm, "actual_seq_lengths_q_pa", None)
+        saved_actual_q_cmp = getattr(fm, "actual_seq_lengths_q_cmp", None)
+        saved_actual_kv = getattr(fm, "actual_seq_lengths_kv", None)
+        q_device = (
+            saved_actual_q_pa.device
+            if isinstance(saved_actual_q_pa, torch.Tensor)
+            else forward_batch.seq_lens.device
+        )
+        kv_device = (
+            saved_actual_kv.device
+            if isinstance(saved_actual_kv, torch.Tensor)
+            else q_device
+        )
+        try:
+            fm.actual_seq_lengths_q = torch.tensor(
+                [1],
+                device=q_device,
+                dtype=torch.int32,
+            )
+            # cu_seqlens_q indexes the one-row q tensor used for row metadata.
+            # The global causal/KV boundary is carried by seqused_kv.
+            fm.actual_seq_lengths_q_pa = torch.tensor(
+                [0, 1],
+                device=q_device,
+                dtype=torch.int32,
+            )
+            fm.actual_seq_lengths_q_cmp = fm.actual_seq_lengths_q_pa.clone()
+            fm.actual_seq_lengths_kv = torch.tensor(
+                [max(1, int(seqused_kv))],
+                device=kv_device,
+                dtype=torch.int32,
+            )
+            return self._compute_kernel_metadata(forward_batch, batch_size=1)
+        finally:
+            fm.actual_seq_lengths_q = saved_actual_q
+            fm.actual_seq_lengths_q_pa = saved_actual_q_pa
+            fm.actual_seq_lengths_q_cmp = saved_actual_q_cmp
+            fm.actual_seq_lengths_kv = saved_actual_kv
+
+    def _ensure_cp_prefill_row_kernel_metadata(
+        self,
+        forward_batch: "ForwardBatch",
+    ) -> None:
+        self.dsv4_cp_prefill_row_kernel_metadata = {}
+        if not can_nsa_prefill_cp_round_robin_split(forward_batch):
+            return
+        if get_bool_env_var("SGLANG_DSV4_NPU_DISABLE_PREFILL_ROW_METADATA", "False"):
+            return
+
+        fm = self.forward_metadata
+        actual_q_pa = getattr(fm, "actual_seq_lengths_q_pa", None)
+        if actual_q_pa is None or actual_q_pa.numel() == 0:
+            return
+        q_rows = int(actual_q_pa[-1].item())
+        if q_rows <= 0:
+            return
+
+        local_positions = self._dsv4_cp_round_robin_local_positions(
+            forward_batch,
+            q_rows,
+            actual_q_pa.device,
+        )
+        # For round-robin CP each local position is unique, so seqused_kv
+        # (= local_pos + 1) is a bijection to the row index.  Key metadata by
+        # seqused_kv; pass global_q_pos = local_pos so the baked
+        # cu_seqlens_q = [local_pos, local_pos+1] encodes the absolute
+        # position — without this the SWA/causal mask always places Q at
+        # position 0, restricting every row to attend only to KV[0].
+        local_positions_list = local_positions.detach().cpu().tolist()
+        unique_seqused_kv = []
+        for local_pos in local_positions_list:
+            local_pos = int(local_pos)
+            seq_len = local_pos + 1  # seqused_kv for this row
+            if seq_len in self.dsv4_cp_prefill_row_kernel_metadata:
+                continue  # already pre-warmed (duplicate global position)
+            unique_seqused_kv.append(seq_len)
+            self.dsv4_cp_prefill_row_kernel_metadata[seq_len] = (
+                self._clone_kernel_metadata(
+                    self._compute_single_query_kernel_metadata(
+                        forward_batch,
+                        seqused_kv=seq_len,
+                        global_q_pos=local_pos,
+                    )
+                )
+            )
+        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            logger.warning(
+                "DSV4 NPU warmed CP prefill row metadata: q_rows=%s, "
+                "unique_rows=%s, min_seqused=%s, max_seqused=%s, positions=%s",
+                q_rows,
+                len(unique_seqused_kv),
+                min(unique_seqused_kv) if len(unique_seqused_kv) > 0 else None,
+                max(unique_seqused_kv) if len(unique_seqused_kv) > 0 else None,
+                local_positions_list,
+            )
+
+    def _ensure_cp_prefill_batch_kernel_metadata(
+        self,
+        forward_batch: "ForwardBatch",
+    ) -> None:
+        """Retained as a no-op placeholder.
+
+        The batched virtual-request approach (one npu_sparse_attn_sharedkv call
+        with batch_size=n_local and per-element seqused_kv) caused aicore DDR
+        errors (errcode 507015) when multiple virtual requests share the same
+        physical KV page — the NPU kernel does not support shared-page batched
+        calls.  The forward methods now use the per-row loop backed by
+        _ensure_cp_prefill_row_kernel_metadata instead.  This stub preserves
+        the attribute so callers that reference dsv4_cp_prefill_batch_kernel_metadata
+        don't raise AttributeError.
+        """
+        self.dsv4_cp_prefill_batch_kernel_metadata = {}
 
     def _build_npu_compress_metadata(self, forward_batch: "ForwardBatch") -> None:
         """Populate c{4,128}_{page_table,state_page_table,state_loc,loc} on
@@ -488,7 +833,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sharedkv accepts). Real ``forward_c4_indexer`` will overwrite the
         contents via ``npu_quant_lightning_indexer``; until then this lets the
         c4 path of ``_forward_compressed`` consume a well-shaped tensor."""
-        if forward_batch.input_ids is not None:
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            T = int(self.forward_metadata.actual_seq_lengths_q_pa[-1].item())
+        elif forward_batch.input_ids is not None:
             T = forward_batch.input_ids.shape[0]
         else:
             T = int(forward_batch.seq_lens.sum().item())
@@ -536,7 +883,9 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio in (0, 1):
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
+            return self._forward_dense(
+                q, k, layer, forward_batch, attn_sink, compress_ratio
+            )
         # ratio 4 / 128 routing — TWO independent gates:
         #   SGLANG_DSV4_NPU_REAL_COMPRESSOR=1 turns on the in-module
         #     forward_npu (compressor writes real KV; output unchanged
@@ -551,25 +900,255 @@ class DeepseekV4AscendAttnBackend(
         c128_only = envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
         # Bisect mode: only c128 layers route to _forward_compressed.
         if c128_only and compress_ratio != 128:
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
+            return self._forward_dense(
+                q, k, layer, forward_batch, attn_sink, compress_ratio
+            )
         if sparse_on or c128_only:
             return self._forward_compressed(
-                q, layer, forward_batch, attn_sink, compress_ratio
+                q, k, layer, forward_batch, attn_sink, compress_ratio
             )
-        return self._forward_dense(q, layer, forward_batch, attn_sink)
+        return self._forward_dense(
+            q, k, layer, forward_batch, attn_sink, compress_ratio
+        )
+
+    def _build_cp_prefill_contiguous_swa_inputs(
+        self,
+        k: torch.Tensor,
+        forward_batch: "ForwardBatch",
+        default_page_table: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        """Build the PA_ND inputs used by the original V4 NPU CP prefill path.
+
+        In round-robin CP prefill, ``k`` has already been all-gathered and
+        reranged back to global token order while ``q`` stays local. Reading
+        through the global SWA pool/page table can observe allocator-specific
+        layout differences; the original branch instead uses this gathered K
+        as a compact per-request page buffer and a matching contiguous block
+        table. This helper mirrors that contract for the A-stage dense path.
+        """
+        if k is None or k.numel() == 0:
+            return None, None
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return None, None
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            seq_lens_list = [int(x) for x in seq_lens_cpu.cpu().tolist()]
+        else:
+            seq_lens_list = [int(x) for x in seq_lens_cpu]
+        total_seq_len = sum(seq_lens_list)
+        if total_seq_len <= 0:
+            return None, None
+
+        expected_k_rows = get_nsa_prefill_cp_total_len(forward_batch)
+        if k.shape[0] != total_seq_len or expected_k_rows != total_seq_len:
+            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                logger.warning(
+                    "DSV4 NPU CP keeps pool SWA inputs because gathered K does "
+                    "not cover the full context: k_rows=%s, total_seq_len=%s, "
+                    "expected_cp_total=%s, seq_lens=%s, extend_lens=%s",
+                    k.shape[0],
+                    total_seq_len,
+                    expected_k_rows,
+                    seq_lens_list,
+                    getattr(forward_batch, "extend_seq_lens_cpu", None),
+                )
+            return None, None
+
+        k_rows = k.unsqueeze(1) if k.ndim == 2 else k
+        if k_rows.ndim != 3:
+            raise RuntimeError(
+                "DeepSeek V4 CP prefill expects gathered K with shape "
+                f"(T, D) or (T, 1, D), got {tuple(k.shape)}."
+            )
+
+        page_size = self.page_size
+        num_pages_list = [
+            (seq_len + page_size - 1) // page_size for seq_len in seq_lens_list
+        ]
+        total_pages = sum(num_pages_list)
+        if total_pages <= 0:
+            return None, None
+
+        kv_pad = k_rows.new_zeros(total_pages * page_size, *k_rows.shape[1:])
+        src_offset = 0
+        page_offset = 0
+        for seq_len, num_pages in zip(seq_lens_list, num_pages_list):
+            if seq_len > 0:
+                dst_start = page_offset * page_size
+                kv_pad[dst_start : dst_start + seq_len].copy_(
+                    k_rows[src_offset : src_offset + seq_len]
+                )
+                src_offset += seq_len
+            page_offset += num_pages
+        ori_kv = kv_pad.view(total_pages, page_size, *k_rows.shape[1:])
+
+        if default_page_table is not None:
+            block_device = default_page_table.device
+            block_dtype = default_page_table.dtype
+            max_blocks = default_page_table.shape[1]
+        else:
+            block_device = k.device
+            block_dtype = torch.int32
+            max_blocks = max(num_pages_list, default=1)
+
+        num_pages_tensor = torch.tensor(
+            num_pages_list, dtype=block_dtype, device=block_device
+        )
+        page_offsets = torch.zeros(
+            len(num_pages_list), dtype=block_dtype, device=block_device
+        )
+        if len(num_pages_list) > 1:
+            page_offsets[1:] = num_pages_tensor[:-1].cumsum(0)
+        arange = torch.arange(max_blocks, dtype=block_dtype, device=block_device)
+        ori_block_table = page_offsets.unsqueeze(1) + arange.unsqueeze(0)
+        ori_block_table = torch.where(
+            arange.unsqueeze(0) < num_pages_tensor.unsqueeze(1),
+            ori_block_table,
+            torch.zeros_like(ori_block_table),
+        ).contiguous()
+
+        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            logger.warning(
+                "DSV4 NPU CP uses contiguous gathered K for SWA prefill: "
+                "k_rows=%s, ori_kv_shape=%s, ori_block_table_shape=%s, "
+                "seq_lens=%s",
+                k.shape[0],
+                tuple(ori_kv.shape),
+                tuple(ori_block_table.shape),
+                seq_lens_list,
+            )
+        return ori_kv, ori_block_table
+
+    def _dsv4_cp_prefill_local_batch_indices(
+        self,
+        forward_batch: "ForwardBatch",
+        num_tokens: int,
+    ) -> Optional[list[int]]:
+        local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+            forward_batch.extend_seq_lens_cpu,
+            keep_zeros=True,
+        )
+        batch_indices: list[int] = []
+        for batch_idx, q_len in enumerate(local_q_lens_cpu):
+            batch_indices.extend([batch_idx] * int(q_len))
+        if len(batch_indices) < num_tokens:
+            return None
+        return batch_indices[:num_tokens]
+
+    def _forward_dense_cp_prefill_torch(
+        self,
+        q: torch.Tensor,
+        ori_kv: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        local_positions: torch.Tensor,
+        local_seqused_kv: torch.Tensor,
+        row_batch_indices: Optional[list[int]],
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """Slow reference path for short CP prefill precision bisection."""
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            raise RuntimeError("Torch dense CP prefill requires seq_lens_cpu.")
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            seq_lens_list = [int(x) for x in seq_lens_cpu.cpu().tolist()]
+        else:
+            seq_lens_list = [int(x) for x in seq_lens_cpu]
+
+        num_pages_list = [
+            (seq_len + self.page_size - 1) // self.page_size
+            for seq_len in seq_lens_list
+        ]
+        page_offsets: list[int] = []
+        acc = 0
+        for num_pages in num_pages_list:
+            page_offsets.append(acc)
+            acc += num_pages
+
+        kv_rows = ori_kv.reshape(-1, *ori_kv.shape[2:])
+        if kv_rows.ndim != 3 or kv_rows.shape[1] != 1:
+            raise RuntimeError(
+                "Torch dense CP prefill expects PA_ND KV shaped "
+                f"(pages, page_size, 1, dim), got {tuple(ori_kv.shape)}."
+            )
+
+        if q.ndim != 3:
+            raise RuntimeError(
+                f"Torch dense CP prefill expects q shaped (T, H, D), got {tuple(q.shape)}."
+            )
+
+        sink = attn_sink.detach().float() if attn_sink is not None else None
+        out = torch.empty_like(q)
+        for row_idx in range(q.shape[0]):
+            batch_idx = (
+                row_batch_indices[row_idx]
+                if row_batch_indices is not None
+                else 0
+            )
+            row_seq_len = int(local_seqused_kv[row_idx].item())
+            row_seq_len = min(row_seq_len, seq_lens_list[batch_idx])
+            win_start = max(0, row_seq_len - self._dsv4_sliding_window_size)
+            base = page_offsets[batch_idx] * self.page_size
+            k_visible = kv_rows[
+                base + win_start : base + row_seq_len,
+                0,
+                :,
+            ].float()
+            if k_visible.numel() == 0:
+                out[row_idx].zero_()
+                continue
+
+            q_row = q[row_idx].float()
+            scores = torch.matmul(q_row, k_visible.transpose(0, 1)) * layer.scaling
+            if sink is not None:
+                sink_logits = sink.to(device=scores.device).reshape(-1, 1)
+                scores = torch.cat([scores, sink_logits], dim=-1)
+                probs = torch.softmax(scores, dim=-1)[..., :-1]
+            else:
+                probs = torch.softmax(scores, dim=-1)
+            out[row_idx].copy_(torch.matmul(probs, k_visible).to(dtype=q.dtype))
+
+        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            logger.warning(
+                "DSV4 CP torch dense prefill: layer=%s ratio=%s n_local=%s "
+                "q_norm=%.4f out_norm=%.4f out_max=%.4f positions=%s",
+                layer.layer_id,
+                compress_ratio,
+                q.shape[0],
+                float(q.float().norm().item()),
+                float(out.float().norm().item()),
+                float(out.float().abs().max().item()),
+                local_positions.detach().cpu().tolist(),
+            )
+        return out
 
     def _forward_dense(
         self,
         q: torch.Tensor,
+        k: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
     ) -> torch.Tensor:
         """ratio=1 / ratio=0 dense layers — sliding-window attention via
         npu_sparse_attn_sharedkv with has_cmp_kv=False."""
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
+        ori_block_table = fm.swa_page_table
+        attn_sink = _dsv4_prepare_attn_sink(attn_sink, layer.layer_id)
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_ori_kv, cp_ori_block_table = self._build_cp_prefill_contiguous_swa_inputs(
+                k,
+                forward_batch,
+                fm.swa_page_table,
+            )
+            if cp_ori_kv is not None:
+                ori_kv = cp_ori_kv
+                ori_block_table = cp_ori_block_table
 
         attn_kwargs = dict(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
@@ -581,17 +1160,146 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=ori_block_table,
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
         )
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            if q.shape[0] == 0:
+                return q
+            n_local = q.shape[0]
+            local_positions = self._dsv4_cp_round_robin_local_positions(
+                forward_batch,
+                n_local,
+                q.device,
+            )
+            # Each local row r has global causal boundary cp_rank + r*cp_size.
+            # Issue one kernel call per Q row so each call carries the correct
+            # seqused_kv for that specific row.  Per-row metadata is pre-warmed
+            # in _ensure_cp_prefill_row_kernel_metadata; the fallback uses the
+            # main fm.kernel_metadata (batch_size=1, matches per-row call).
+            local_seqused_kv = (local_positions + 1).to(fm.actual_seq_lengths_kv.dtype)
+            # cu_seqlens_q_dtype — reuse from the forward-metadata tensor.
+            _cu_q_dtype = fm.actual_seq_lengths_q_pa.dtype
+            row_batch_indices = self._dsv4_cp_prefill_local_batch_indices(
+                forward_batch,
+                n_local,
+            )
+            _cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            _torch_dense_prefill = get_bool_env_var(
+                "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL", "False"
+            )
+            if _torch_dense_prefill:
+                return self._forward_dense_cp_prefill_torch(
+                    q,
+                    ori_kv,
+                    layer,
+                    forward_batch,
+                    local_positions,
+                    local_seqused_kv,
+                    row_batch_indices,
+                    attn_sink,
+                    compress_ratio,
+                )
+            _skip_row_meta = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_SKIP_ROW_META", "False"
+            )
+            if _cp_verify:
+                logger.warning(
+                    "DSV4 CP dense prefill: layer=%s ratio=%s n_local=%s "
+                    "ori_kv_shape=%s ori_block_table_shape=%s "
+                    "q_norm=%.4f seqused_kv_min=%s seqused_kv_max=%s",
+                    layer.layer_id,
+                    compress_ratio,
+                    n_local,
+                    tuple(ori_kv.shape),
+                    tuple(ori_block_table.shape),
+                    float(q.float().norm().item()),
+                    int(local_seqused_kv.min().item()),
+                    int(local_seqused_kv.max().item()),
+                )
+            out = torch.empty_like(q)
+            for row_idx in range(n_local):
+                row_seq_len = int(local_seqused_kv[row_idx].item())
+                row_global_q_pos = int(local_positions[row_idx].item())
+                batch_idx = (
+                    row_batch_indices[row_idx]
+                    if row_batch_indices is not None
+                    else 0
+                )
+                # cu_seqlens_q indexes q[row_idx:row_idx+1]; use local offsets.
+                # The global causal/KV boundary is carried by row_seqused_kv.
+                row_cu_seqlens_q = torch.tensor(
+                    [0, 1],
+                    dtype=_cu_q_dtype,
+                    device=q.device,
+                )
+                row_seqused_kv = torch.tensor(
+                    [row_seq_len],
+                    dtype=fm.actual_seq_lengths_kv.dtype,
+                    device=q.device,
+                )
+                if _skip_row_meta:
+                    # Use the main (full-batch) metadata for all rows.
+                    # Diagnostic path: if this fixes wrong output the bug is
+                    # in _ensure_cp_prefill_row_kernel_metadata.
+                    row_metadata = fm.kernel_metadata["c1a_metadata"]
+                else:
+                    row_meta = self.dsv4_cp_prefill_row_kernel_metadata.get(
+                        row_seq_len
+                    )
+                    row_metadata = (
+                        row_meta["c1a_metadata"]
+                        if row_meta
+                        else fm.kernel_metadata["c1a_metadata"]
+                    )
+                row_attn_kwargs = dict(attn_kwargs)
+                row_attn_kwargs.update(
+                    {
+                        "cu_seqlens_q": row_cu_seqlens_q,
+                        "seqused_kv": row_seqused_kv,
+                        "q": q[row_idx : row_idx + 1],
+                        "ori_block_table": ori_block_table[
+                            batch_idx : batch_idx + 1
+                        ],
+                        "metadata": row_metadata,
+                    }
+                )
+                row_out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+                    **row_attn_kwargs
+                )
+                if _cp_verify and (
+                    row_idx == 0
+                    or row_idx == n_local - 1
+                    or row_idx % max(1, n_local // 4) == 0
+                ):
+                    logger.warning(
+                        "DSV4 CP dense row: layer=%s row=%d/%d "
+                        "global_q_pos=%d seqused_kv=%d batch_idx=%d "
+                        "q_norm=%.4f out_norm=%.4f out_max=%.4f "
+                        "out_first=%s",
+                        layer.layer_id,
+                        row_idx,
+                        n_local,
+                        row_global_q_pos,
+                        row_seq_len,
+                        batch_idx,
+                        float(q[row_idx].float().norm().item()),
+                        float(row_out.float().norm().item()),
+                        float(row_out.float().abs().max().item()),
+                        row_out.view(-1)[:4].float().tolist(),
+                    )
+                out[row_idx : row_idx + 1].copy_(row_out)
+            return out
+
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
     def _forward_compressed(
         self,
         q: torch.Tensor,
+        k: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         attn_sink: Optional[torch.Tensor],
@@ -613,6 +1321,7 @@ class DeepseekV4AscendAttnBackend(
         pool = forward_batch.token_to_kv_pool
         metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+        attn_sink = _dsv4_prepare_attn_sink(attn_sink, layer.layer_id)
 
         if metadata is None or cmp_kv is None:
             raise RuntimeError(
@@ -627,6 +1336,16 @@ class DeepseekV4AscendAttnBackend(
             )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
+        ori_block_table = fm.swa_page_table
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_ori_kv, cp_ori_block_table = self._build_cp_prefill_contiguous_swa_inputs(
+                k,
+                forward_batch,
+                fm.swa_page_table,
+            )
+            if cp_ori_kv is not None:
+                ori_kv = cp_ori_kv
+                ori_block_table = cp_ori_block_table
 
         # Reshape cmp_kv to share page_size with ori_kv before the kernel call.
         # main's V4 pool layout: c{N}_kv_pool buffer is (num_pages, page_size//
@@ -668,7 +1387,7 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=ori_block_table,
             sinks=attn_sink,
             metadata=metadata,
             softmax_scale=layer.scaling,
@@ -696,6 +1415,156 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            if q.shape[0] == 0:
+                return q
+            n_local = q.shape[0]
+            local_positions = self._dsv4_cp_round_robin_local_positions(
+                forward_batch,
+                n_local,
+                q.device,
+            )
+            # Per-row kernel calls: each row has its own causal KV boundary.
+            # Per-row metadata is pre-warmed in _ensure_cp_prefill_row_kernel_metadata.
+            local_seqused_kv = (local_positions + 1).to(fm.actual_seq_lengths_kv.dtype)
+            # cu_seqlens_q_dtype — reuse from the forward-metadata tensor.
+            _cu_q_dtype = fm.actual_seq_lengths_q_pa.dtype
+            row_batch_indices = self._dsv4_cp_prefill_local_batch_indices(
+                forward_batch,
+                n_local,
+            )
+            disable_prefill_cmp_kv = get_bool_env_var(
+                "SGLANG_DSV4_NPU_DISABLE_PA_PREFILL_CMP_KV",
+                "False",
+            )
+            _cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            _skip_row_meta = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_SKIP_ROW_META", "False"
+            )
+            if _cp_verify:
+                logger.warning(
+                    "DSV4 CP compressed prefill: layer=%s ratio=%s n_local=%s "
+                    "ori_kv_shape=%s ori_block_table_shape=%s "
+                    "q_norm=%.4f seqused_kv_min=%s seqused_kv_max=%s",
+                    layer.layer_id,
+                    compress_ratio,
+                    n_local,
+                    tuple(ori_kv.shape),
+                    tuple(ori_block_table.shape),
+                    float(q.float().norm().item()),
+                    int(local_seqused_kv.min().item()),
+                    int(local_seqused_kv.max().item()),
+                )
+            topk_for_rows = attn_kwargs.get("cmp_sparse_indices")  # (bs, 1, topk_k) or None
+            out = torch.empty_like(q)
+            for row_idx in range(n_local):
+                row_seq_len = int(local_seqused_kv[row_idx].item())
+                row_global_q_pos = int(local_positions[row_idx].item())
+                batch_idx = (
+                    row_batch_indices[row_idx]
+                    if row_batch_indices is not None
+                    else 0
+                )
+                # cu_seqlens_q indexes q[row_idx:row_idx+1]; use local offsets.
+                # The global causal/KV boundary is carried by row_seqused_kv.
+                row_cu_seqlens_q = torch.tensor(
+                    [0, 1],
+                    dtype=_cu_q_dtype,
+                    device=q.device,
+                )
+                row_seqused_kv = torch.tensor(
+                    [row_seq_len],
+                    dtype=fm.actual_seq_lengths_kv.dtype,
+                    device=q.device,
+                )
+                # Determine whether this specific row has compressed KV.
+                if disable_prefill_cmp_kv:
+                    row_has_cmp = False
+                elif compress_ratio == 4 and topk_for_rows is not None:
+                    row_has_cmp = bool(
+                        (topk_for_rows[batch_idx : batch_idx + 1] >= 0).any().item()
+                    )
+                else:
+                    row_has_cmp = row_seq_len >= compress_ratio
+                metadata_key = (
+                    f"c{compress_ratio}a_metadata" if row_has_cmp else "c1a_metadata"
+                )
+                if _skip_row_meta:
+                    # Diagnostic path: bypass per-row metadata, use the main
+                    # (full-batch) metadata. If this fixes wrong output, the
+                    # bug is in _ensure_cp_prefill_row_kernel_metadata.
+                    row_metadata = fm.kernel_metadata.get(
+                        metadata_key, fm.kernel_metadata["c1a_metadata"]
+                    )
+                else:
+                    row_meta = self.dsv4_cp_prefill_row_kernel_metadata.get(row_seq_len)
+                    if row_meta and metadata_key in row_meta:
+                        row_metadata = row_meta[metadata_key]
+                    elif row_meta:
+                        row_metadata = row_meta.get(
+                            "c1a_metadata", fm.kernel_metadata["c1a_metadata"]
+                        )
+                    else:
+                        row_metadata = fm.kernel_metadata.get(
+                            metadata_key, fm.kernel_metadata["c1a_metadata"]
+                        )
+                row_attn_kwargs = dict(attn_kwargs)
+                row_attn_kwargs.update(
+                    {
+                        "cu_seqlens_q": row_cu_seqlens_q,
+                        "seqused_kv": row_seqused_kv,
+                        "q": q[row_idx : row_idx + 1],
+                        "ori_block_table": ori_block_table[
+                            batch_idx : batch_idx + 1
+                        ],
+                        "metadata": row_metadata,
+                    }
+                )
+                if row_has_cmp:
+                    # Per-row compressed block table.
+                    if "cmp_block_table" in row_attn_kwargs:
+                        row_attn_kwargs["cmp_block_table"] = row_attn_kwargs[
+                            "cmp_block_table"
+                        ][batch_idx : batch_idx + 1]
+                    # Per-row topk indices: slice to (1, 1, topk_k).
+                    if topk_for_rows is not None:
+                        row_attn_kwargs["cmp_sparse_indices"] = topk_for_rows[
+                            batch_idx : batch_idx + 1
+                        ]
+                else:
+                    for key in (
+                        "cmp_ratio",
+                        "cmp_mask_mode",
+                        "cmp_kv",
+                        "cmp_sparse_indices",
+                        "cmp_block_table",
+                    ):
+                        row_attn_kwargs.pop(key, None)
+                row_out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+                    **row_attn_kwargs
+                )
+                if _cp_verify and (
+                    row_idx == 0
+                    or row_idx == n_local - 1
+                    or row_idx % max(1, n_local // 4) == 0
+                ):
+                    logger.warning(
+                        "DSV4 CP compressed row: layer=%s ratio=%s "
+                        "row=%d/%d global_q_pos=%d seqused_kv=%d has_cmp=%s "
+                        "q_norm=%.4f out_norm=%.4f out_max=%.4f",
+                        layer.layer_id,
+                        compress_ratio,
+                        row_idx,
+                        n_local,
+                        row_global_q_pos,
+                        row_seq_len,
+                        row_has_cmp,
+                        float(q[row_idx].float().norm().item()),
+                        float(row_out.float().norm().item()),
+                        float(row_out.float().abs().max().item()),
+                    )
+                out[row_idx : row_idx + 1].copy_(row_out)
+            return out
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
@@ -713,6 +1582,32 @@ class DeepseekV4AscendAttnBackend(
         """
         pool = forward_batch.token_to_kv_pool
         swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cache_rows = int(swa_k.shape[0])
+            loc_rows = int(swa_loc.numel())
+            if cache_rows < loc_rows:
+                if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                    logger.warning(
+                        "DSV4 NPU CP trims padded SWA cache locs before write: "
+                        "layer_id=%s, cache_rows=%s, loc_rows=%s, "
+                        "num_token_non_padded=%s, extend_lens=%s",
+                        layer_id,
+                        cache_rows,
+                        loc_rows,
+                        getattr(forward_batch, "num_token_non_padded_cpu", None),
+                        getattr(forward_batch, "extend_seq_lens_cpu", None),
+                    )
+                swa_loc = swa_loc[:cache_rows]
+        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            logger.warning(
+                "DSV4 store_cache: layer_id=%s swa_k_shape=%s swa_k_norm=%.4f "
+                "swa_loc_shape=%s swa_k_max=%.4f",
+                layer_id,
+                tuple(swa_k.shape),
+                float(swa_k.float().norm().item()),
+                tuple(swa_loc.shape),
+                float(swa_k.float().abs().max().item()),
+            )
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,

@@ -30,8 +30,11 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
+    get_nsa_prefill_cp_rank,
+    get_nsa_prefill_cp_size,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_q_seqs_cpu,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -41,8 +44,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_partial,
     dp_scatter,
-    get_attention_cp_rank,
-    get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -80,6 +81,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
+    get_current_device_stream_fast,
     log_info_on_rank0,
     make_layers,
 )
@@ -95,6 +98,124 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+
+def _nsa_cp_round_robin_local_token_count(forward_batch: "ForwardBatch"):
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend_seq_lens_cpu is None:
+        return None
+    local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+        extend_seq_lens_cpu,
+        keep_zeros=True,
+    )
+    return int(sum(local_q_lens_cpu))
+
+
+def _dsv4_npu_cp_value_debug_enabled(forward_batch: "ForwardBatch") -> bool:
+    if not get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG", "False"):
+        return False
+    if nsa_use_prefill_cp(forward_batch):
+        return True
+    return (
+        forward_batch.forward_mode.is_decode()
+        and get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_DECODE", "False")
+    )
+
+
+def _dsv4_npu_log_tensor_stats(
+    name: str,
+    tensor: Optional[torch.Tensor],
+    forward_batch: "ForwardBatch",
+    *,
+    layer_id: Optional[int] = None,
+) -> None:
+    if not _dsv4_npu_cp_value_debug_enabled(forward_batch):
+        return
+    if tensor is None:
+        logger.warning("DSV4 NPU CP value debug: %s is None", name)
+        return
+    try:
+        data = tensor.detach()
+        flat = data.float().reshape(-1)
+        if flat.numel() == 0:
+            logger.warning(
+                "DSV4 NPU CP value debug: %s layer=%s shape=%s dtype=%s empty",
+                name,
+                layer_id,
+                tuple(data.shape),
+                data.dtype,
+            )
+            return
+        finite = torch.isfinite(flat)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_flat = flat[finite]
+            abs_mean = float(finite_flat.abs().mean().item())
+            abs_max = float(finite_flat.abs().max().item())
+            mean = float(finite_flat.mean().item())
+        else:
+            abs_mean = abs_max = mean = float("nan")
+        row_first_norm = row_last_norm = None
+        if data.ndim > 0 and data.shape[0] > 0:
+            rows = data.float().reshape(data.shape[0], -1)
+            row_first_norm = float(rows[0].norm().item())
+            row_last_norm = float(rows[-1].norm().item())
+        sample = flat[: min(6, flat.numel())].cpu().tolist()
+        logger.warning(
+            "DSV4 NPU CP value debug: %s layer=%s mode=%s shape=%s dtype=%s "
+            "finite=%s/%s mean=%.6e abs_mean=%.6e abs_max=%.6e "
+            "row_norm(first,last)=%s,%s sample=%s",
+            name,
+            layer_id,
+            forward_batch.forward_mode,
+            tuple(data.shape),
+            data.dtype,
+            finite_count,
+            flat.numel(),
+            mean,
+            abs_mean,
+            abs_max,
+            row_first_norm,
+            row_last_norm,
+            sample,
+        )
+    except Exception as exc:
+        logger.warning("DSV4 NPU CP value debug failed for %s: %s", name, exc)
+
+
+def _dsv4_npu_log_logits_stats(
+    name: str,
+    logits: Optional[torch.Tensor],
+    forward_batch: "ForwardBatch",
+) -> None:
+    if not _dsv4_npu_cp_value_debug_enabled(forward_batch) or logits is None:
+        return
+    _dsv4_npu_log_tensor_stats(name, logits, forward_batch)
+    try:
+        if logits.numel() == 0 or logits.ndim < 2:
+            return
+        row = logits[0].detach().float()
+        top_vals, top_ids = torch.topk(row, k=min(8, row.shape[-1]))
+        logger.warning(
+            "DSV4 NPU CP value debug: %s top ids=%s vals=%s",
+            name,
+            top_ids.cpu().tolist(),
+            top_vals.cpu().tolist(),
+        )
+    except Exception as exc:
+        logger.warning("DSV4 NPU CP logits topk debug failed for %s: %s", name, exc)
+
+
+def _dsv4_npu_layer_detail_debug_enabled(
+    forward_batch: "ForwardBatch",
+    layer_id: int,
+    num_hidden_layers: int,
+) -> bool:
+    if not _dsv4_npu_cp_value_debug_enabled(forward_batch):
+        return False
+    if get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_ALL_LAYERS", "False"):
+        return True
+    return layer_id == 0 or layer_id == num_hidden_layers - 1
 
 
 def _v4_rope_inplace_npu(
@@ -272,7 +393,14 @@ class MQALayer(nn.Module):
         self.tp_size = attn_tp_size = get_attention_tp_size()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_nsa_prefill_cp_size()
+            assert attn_tp_size == 1, (
+                "DeepSeek V4 context-parallel token splitting requires "
+                "attn_tp_size == 1 (each CP rank is its own TP singleton). "
+                f"Got attn_tp_size={attn_tp_size}. "
+                "Check that tp_size, dp_size, and attn_cp_size are configured "
+                "so that attn_tp_size = tp_size // dp_size // attn_cp_size == 1."
+            )
             self.tp_rank = attn_tp_rank = 0
             self.tp_size = attn_tp_size = 1
         self.layer_id = layer_id
@@ -391,7 +519,7 @@ class MQALayer(nn.Module):
                     alt_streams=self.alt_streams_indexer,
                 )
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -665,7 +793,13 @@ class MQALayer(nn.Module):
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
+            )
+            _dsv4_npu_log_tensor_stats(
+                "mqa.gathered_kv",
+                kv,
+                forward_batch,
+                layer_id=self.layer_id,
             )
 
         if self.overlap_store_cache:
@@ -678,8 +812,25 @@ class MQALayer(nn.Module):
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
         if self.compressor is not None:
+            compressor_x = x
+            if (
+                self.nsa_enable_prefill_cp
+                and nsa_use_prefill_cp(forward_batch)
+                and is_nsa_prefill_cp_round_robin_split()
+            ):
+                # Round-robin CP: each rank holds a strided token shard, but the
+                # compressor needs contiguous full-sequence activations to produce
+                # correct compressed KV. All-gather and rerange before compressing.
+                # In-seq-split CP does not need this because each rank's shard is
+                # already a contiguous subsequence.
+                compressor_x = cp_all_gather_rerange_output(
+                    x.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    get_current_device_stream_fast(),
+                )
             attn_backend.forward_core_compressor(
-                x,
+                compressor_x,
                 forward_batch,
                 self.layer_id,
                 self.compressor,
@@ -735,6 +886,12 @@ class MQALayer(nn.Module):
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
             save_kv_cache=not self.overlap_store_cache,
+        )
+        _dsv4_npu_log_tensor_stats(
+            "mqa.attn_out",
+            o,
+            forward_batch,
+            layer_id=self.layer_id,
         )
         o = o[:, tp_slice, :]
         if _is_npu:
@@ -801,6 +958,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self.num_hidden_layers = config.num_hidden_layers
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -992,6 +1150,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
+        layer_debug = _dsv4_npu_layer_detail_debug_enabled(
+            forward_batch,
+            self.layer_id,
+            self.num_hidden_layers,
+        )
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -1002,14 +1165,35 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if not norm_fused:
             hidden_states = self.input_layernorm(hidden_states)
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.attn_normed",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
 
         hidden_states = self.self_attn(
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
         )
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.attn_out",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.after_attn_hc_post",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -1020,6 +1204,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.mlp_normed",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1038,9 +1229,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "CP requires DeepEP (moe_a2a_backend == deepep). "
                 "Only DeepEP is tested with CP's per-rank token split."
             )
-            cp_rank = get_attention_cp_rank()
-            cp_size = get_attention_cp_size()
+            cp_rank = get_nsa_prefill_cp_rank()
+            cp_size = get_nsa_prefill_cp_size()
             input_ids = input_ids[cp_rank::cp_size].contiguous()
+            if is_nsa_prefill_cp_round_robin_split():
+                local_num_tokens = hidden_states.shape[0]
+                if input_ids.shape[0] > local_num_tokens:
+                    input_ids = input_ids[:local_num_tokens].contiguous()
+                elif input_ids.shape[0] < local_num_tokens:
+                    raise RuntimeError(
+                        "DeepSeek V4 CP input_ids split is shorter than local "
+                        f"hidden states: input_ids={input_ids.shape[0]}, "
+                        f"hidden_states={local_num_tokens}, layer_id={self.layer_id}."
+                    )
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
@@ -1064,6 +1265,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.mlp_out",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_attention_tp_group()),
@@ -1077,6 +1285,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.final",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
 
         return hidden_states
 
@@ -1128,7 +1343,7 @@ class DeepseekV4Model(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_cp_size()
+            self.cp_size = get_nsa_prefill_cp_size()
 
     def hc_head(
         self,
@@ -1165,6 +1380,7 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        _dsv4_npu_log_tensor_stats("model.embed", hidden_states, forward_batch)
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1182,6 +1398,39 @@ class DeepseekV4Model(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if is_nsa_prefill_cp_round_robin_split():
+                local_num_tokens = _nsa_cp_round_robin_local_token_count(forward_batch)
+                if local_num_tokens is not None:
+                    if hidden_states.shape[0] > local_num_tokens:
+                        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                            logger.warning(
+                                "DSV4 NPU CP trims local padded shard before "
+                                "layers: hidden_rows=%s, position_rows=%s, "
+                                "local_real_rows=%s, extend_lens=%s",
+                                hidden_states.shape[0],
+                                positions.shape[0],
+                                local_num_tokens,
+                                getattr(forward_batch, "extend_seq_lens_cpu", None),
+                            )
+                        hidden_states = hidden_states[:local_num_tokens].contiguous()
+                        positions = positions[:local_num_tokens].contiguous()
+                    elif hidden_states.shape[0] < local_num_tokens:
+                        raise RuntimeError(
+                            "DeepSeek V4 CP local shard is shorter than expected: "
+                            f"hidden_rows={hidden_states.shape[0]}, "
+                            f"local_real_rows={local_num_tokens}, "
+                            f"extend_lens={getattr(forward_batch, 'extend_seq_lens_cpu', None)}."
+                        )
+            _dsv4_npu_log_tensor_stats(
+                "model.after_cp_split.hidden",
+                hidden_states,
+                forward_batch,
+            )
+            _dsv4_npu_log_tensor_stats(
+                "model.after_cp_split.positions",
+                positions,
+                forward_batch,
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1192,21 +1441,35 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
+            if i == self.start_layer or i == self.end_layer - 1:
+                _dsv4_npu_log_tensor_stats(
+                    "model.after_layer",
+                    hidden_states,
+                    forward_batch,
+                    layer_id=i,
+                )
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                get_current_device_stream_fast(),
+            )
+            _dsv4_npu_log_tensor_stats(
+                "model.after_cp_gather",
+                hidden_states,
+                forward_batch,
             )
 
         pre_hc_head = hidden_states.flatten(1)
+        _dsv4_npu_log_tensor_stats("model.pre_hc_head", pre_hc_head, forward_batch)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+        _dsv4_npu_log_tensor_stats("model.final_norm", hidden_states, forward_batch)
 
         return hidden_states, pre_hc_head
 
@@ -1251,8 +1514,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
+            self.cp_rank = get_nsa_prefill_cp_rank()
+            self.cp_size = get_nsa_prefill_cp_size()
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1280,24 +1543,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            assert (not _is_npu) or is_nsa_prefill_cp_round_robin_split(), (
+                "DeepSeek V4 NPU CP currently supports only "
+                "nsa_prefill_cp_mode=round-robin-split."
+            )
+            # Round-robin CP activates via forward_mode.is_prefill(); it does NOT
+            # use can_nsa_cp_split (which checks is_context_parallel_extend() —
+            # always False for round-robin) or prepare_context_parallel_metadata.
+            # In-seq-split CP uses can_nsa_cp_split + prepare_context_parallel_metadata.
+            if is_nsa_prefill_cp_round_robin_split():
+                # Round-robin: no attn_cp_metadata needed; CP is driven by the
+                # nsa_use_prefill_cp / can_nsa_prefill_cp_round_robin_split gates.
+                pass
+            elif can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                # In-seq-split: build zigzag context-parallel metadata for all
+                # devices. prepare_context_parallel_metadata sets attn_cp_metadata
+                # which the flash-attention backend uses to partition tokens.
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                if is_nsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
-                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
@@ -1308,7 +1575,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -1316,6 +1583,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             aux_hidden_states,
             hidden_states_before_norm=pre_hc_head,
         )
+        _dsv4_npu_log_logits_stats(
+            "logits.next_token",
+            logits_output.next_token_logits,
+            forward_batch,
+        )
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout

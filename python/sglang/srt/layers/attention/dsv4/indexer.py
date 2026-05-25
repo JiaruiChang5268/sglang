@@ -23,9 +23,16 @@ from sglang.srt.layers.attention.dsv4.compressor import (
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
+    get_nsa_prefill_cp_size,
+    nsa_cp_round_robin_split_data,
+    nsa_cp_round_robin_split_q_seqs_cpu,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip, is_npu
+from sglang.srt.utils import add_prefix, get_current_device_stream_fast, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -658,9 +665,13 @@ class C4Indexer(nn.Module):
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
+        use_prefill_cp = can_nsa_prefill_cp_round_robin_split(forward_batch)
+        positions = forward_batch.positions
+        if use_prefill_cp and positions.shape[0] != x.shape[0]:
+            positions = nsa_cp_round_robin_split_data(positions)
 
         # q path
-        q = self._compute_q_npu(q_lora, forward_batch.positions)
+        q = self._compute_q_npu(q_lora, positions)
 
         # weights path — keep the bf16 → bf16 projection (iforgetmyname
         # forward_npu_dsv4 L2044) and apply the combined softmax + n_heads
@@ -669,7 +680,15 @@ class C4Indexer(nn.Module):
         weights = weights * (self.softmax_scale * self.n_heads**-0.5)
 
         # compressor path — writes c4 indexer compress kv + state on NPU.
-        self.compressor(x, forward_batch)
+        compressor_x = x
+        if use_prefill_cp:
+            compressor_x = cp_all_gather_rerange_output(
+                x.contiguous(),
+                get_nsa_prefill_cp_size(),
+                forward_batch,
+                get_current_device_stream_fast(),
+            )
+        self.compressor(compressor_x, forward_batch)
 
         # Step-5d sentinel gate. Until SGLANG_DSV4_NPU_REAL_INDEXER=1, NPU
         # short-circuits to -1 sentinel (kept available so callers can keep
@@ -688,7 +707,7 @@ class C4Indexer(nn.Module):
         # Prefer the fused int8 lightning indexer when the indexer KV is
         # quantized (matches iforgetmyname's li_kv_dtype == "int8" branch).
         li_kv_dtype = getattr(self.compressor, "li_kv_dtype", "bf16")
-        if li_kv_dtype == "int8":
+        if li_kv_dtype == "int8" and not use_prefill_cp:
             # Step-5e: skip the indexer kernel call when this rank's batch
             # is empty (no tokens to score). DP attention can leave some
             # ranks with an empty batch in flight; calling
@@ -723,20 +742,50 @@ class C4Indexer(nn.Module):
         end_pos = forward_batch.seq_lens.cumsum(dim=0)
         page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
         attn_tp_size = get_attention_tp_size()
+        local_seq_lens_cpu = None
+        local_q_offset = 0
+        if use_prefill_cp:
+            local_seq_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
+                forward_batch.extend_seq_lens_cpu,
+                keep_zeros=True,
+            )
         topk_idxs: list[torch.Tensor] = []
         for i, _end_token in enumerate(end_pos):
             seq_i = int(seqlens_cpu[i])
+            kv_len = seq_i // ratio
             kv_indices = _get_kv_indices(
-                forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
+                forward_batch, kv_len, page_table, i, kv_len
             )
             kv_cache_value = (
                 forward_batch.token_to_kv_pool.get_compress_buffer(
                     self.layer_id, True, kv_indices
                 )
             )
+            if li_kv_dtype == "int8":
+                kv_scale = forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                    self.layer_id,
+                    True,
+                )
+                kv_scale = kv_scale.flatten(0, 1)[kv_indices]
+                kv_cache_value = (
+                    kv_cache_value.to(torch.float32) * kv_scale.to(torch.float32)
+                ).to(q.dtype)
             if is_prefill:
-                start = 0 if i == 0 else int(end_pos[i - 1])
-                end = int(end_pos[i])
+                if use_prefill_cp:
+                    assert local_seq_lens_cpu is not None
+                    local_q_len = int(local_seq_lens_cpu[i])
+                    start = local_q_offset
+                    end = start + local_q_len
+                    local_q_offset = end
+                    if local_q_len == 0:
+                        continue
+                    positions_for_mask = positions[start:end].to(device)
+                else:
+                    start = 0 if i == 0 else int(end_pos[i - 1])
+                    end = int(end_pos[i])
+                    positions_for_mask = torch.arange(
+                        1, seq_i + 1, device=device
+                    )
                 index_score = torch.einsum(
                     "shd,td->sht",
                     q[start:end, ...],
@@ -748,20 +797,22 @@ class C4Indexer(nn.Module):
                 if attn_tp_size > 1 and getattr(self, "enable_indexer_tp", False):
                     get_attention_tp_group().all_reduce(index_score)
                 # Causal mask in compressed-token coordinates.
-                arange_kv = torch.arange(seq_i // ratio, device=device)
-                arange_q = torch.arange(1, seq_i + 1, device=device).unsqueeze(1)
-                causal = arange_kv.repeat(seq_i, 1) >= (arange_q // ratio)
+                arange_kv = torch.arange(kv_len, device=device)
+                arange_q = torch.div(
+                    positions_for_mask + 1,
+                    ratio,
+                    rounding_mode="floor",
+                ).unsqueeze(1)
+                causal = arange_kv.repeat(end - start, 1) >= arange_q
                 index_score += torch.where(
                     causal, float("-inf"), torch.zeros((), device=device)
                 )
                 topk_idx = index_score.topk(
-                    min(self.index_topk, seq_i // ratio), dim=-1
+                    min(self.index_topk, kv_len), dim=-1
                 )[1]
                 # Drop the diagonal token (position seq_i % ratio == 0
                 # leaves a self-loop after the // ratio division).
-                drop = topk_idx >= (
-                    torch.arange(1, seq_i + 1, device=device).unsqueeze(1) // ratio
-                )
+                drop = topk_idx >= arange_q
                 topk_idx = torch.where(drop, -1, topk_idx)
             else:
                 index_score = torch.einsum(
@@ -773,7 +824,7 @@ class C4Indexer(nn.Module):
                     index_score.relu_() * weights.unsqueeze(-1)[i]
                 ).sum(dim=1)
                 topk_idx = index_score.topk(
-                    min(self.index_topk, seq_i // ratio), dim=-1
+                    min(self.index_topk, kv_len), dim=-1
                 )[1]
             topk_idx = F.pad(
                 topk_idx,
@@ -782,6 +833,12 @@ class C4Indexer(nn.Module):
                 value=-1,
             )
             topk_idxs.append(topk_idx)
+        if not topk_idxs:
+            return torch.empty(
+                (0, self.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _forward_npu_fused(

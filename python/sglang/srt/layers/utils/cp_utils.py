@@ -11,10 +11,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
-    get_attention_cp_size,
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_current_device_stream_fast
 
 
 @dataclass
@@ -67,15 +67,15 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     from sglang.srt.layers.attention.nsa.utils import (
+        get_nsa_prefill_cp_total_len,
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        total_len = get_nsa_prefill_cp_total_len(forward_batch)
+        if len(input_) > total_len:
+            input_ = input_[:total_len]
         return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -89,16 +89,15 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     from sglang.srt.layers.attention.nsa.utils import (
+        get_nsa_prefill_cp_total_len,
         is_nsa_prefill_cp_round_robin_split,
         nsa_cp_round_robin_split_data,
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
+        total_len = get_nsa_prefill_cp_total_len(forward_batch)
+        if len(positions) > total_len:
+            positions = positions[:total_len]
         return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
@@ -239,27 +238,41 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     from sglang.srt.layers.attention.nsa.utils import (
+        get_nsa_prefill_cp_size,
+        get_nsa_prefill_cp_total_len,
         is_nsa_prefill_cp_round_robin_split,
     )
 
     if is_nsa_prefill_cp_round_robin_split():
+        cp_size = get_nsa_prefill_cp_size()
+        total_len = get_nsa_prefill_cp_total_len(forward_batch)
+        if input_tensor.shape[0] == total_len:
+            return input_tensor
+        max_len = (total_len + cp_size - 1) // cp_size
+        if input_tensor.shape[0] > max_len:
+            raise RuntimeError(
+                "Invalid round-robin CP shard length: "
+                f"local_len={input_tensor.shape[0]}, max_rank_len={max_len}, "
+                f"total_len={total_len}, cp_size={cp_size}."
+            )
+        pad_len = max_len - input_tensor.shape[0]
+        if pad_len > 0:
+            padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_len]
+            input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+                (max_len * cp_size, *input_tensor.shape[1:]),
             )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
+        get_attention_cp_group().all_gather_into_tensor(output_tensor, input_tensor)
         out_shape = output_tensor.shape
         output_tensor = (
             output_tensor.view(cp_size, -1, *out_shape[1:])
             .transpose(0, 1)
             .reshape(out_shape)
         )
-        return output_tensor
+        return output_tensor[:total_len]
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
@@ -301,6 +314,43 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    from sglang.srt.layers.attention.nsa.utils import (
+        get_nsa_prefill_cp_size,
+        get_nsa_prefill_cp_total_len,
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    if is_nsa_prefill_cp_round_robin_split():
+        cp_size = get_nsa_prefill_cp_size()
+        total_len = get_nsa_prefill_cp_total_len(forward_batch)
+        if input_tensor.shape[0] == total_len:
+            return input_tensor
+        max_len = (total_len + cp_size - 1) // cp_size
+        if input_tensor.shape[0] > max_len:
+            raise RuntimeError(
+                "Invalid round-robin CP KV shard length: "
+                f"local_len={input_tensor.shape[0]}, max_rank_len={max_len}, "
+                f"total_len={total_len}, cp_size={cp_size}."
+            )
+        pad_len = max_len - input_tensor.shape[0]
+        if pad_len > 0:
+            padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_len]
+            input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
+        with use_symmetric_memory(
+            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        ):
+            output_tensor = input_tensor.new_empty(
+                (max_len * cp_size, *input_tensor.shape[1:]),
+            )
+        get_attention_cp_group().all_gather_into_tensor(output_tensor, input_tensor)
+        out_shape = output_tensor.shape
+        output_tensor = (
+            output_tensor.view(cp_size, -1, *out_shape[1:])
+            .transpose(0, 1)
+            .reshape(out_shape)
+        )
+        return output_tensor[:total_len]
+
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
@@ -336,10 +386,10 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     v = v.contiguous()
 
     key_cache_full = cp_all_gather_rerange_kv_cache(
-        k, cp_size, forward_batch, torch.cuda.current_stream()
+        k, cp_size, forward_batch, get_current_device_stream_fast()
     )
     value_cache_full = cp_all_gather_rerange_kv_cache(
-        v, cp_size, forward_batch, torch.cuda.current_stream()
+        v, cp_size, forward_batch, get_current_device_stream_fast()
     )
 
     forward_batch.token_to_kv_pool.set_kv_buffer(
