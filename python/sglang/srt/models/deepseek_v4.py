@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
 
 from sglang.srt.distributed import (
@@ -98,6 +99,33 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED = False
+
+
+def _dsv4_npu_layer_filter_matches(
+    layer_filter: Optional[str],
+    layer_id: int,
+    num_hidden_layers: Optional[int] = None,
+) -> bool:
+    if not layer_filter:
+        return False
+    for item in layer_filter.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == "last":
+            if num_hidden_layers is not None and layer_id == num_hidden_layers - 1:
+                return True
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if start.strip().isdigit() and end.strip().isdigit():
+                if int(start) <= layer_id <= int(end):
+                    return True
+            continue
+        if item.isdigit() and layer_id == int(item):
+            return True
+    return False
 
 
 def _nsa_cp_round_robin_local_token_count(forward_batch: "ForwardBatch"):
@@ -112,7 +140,12 @@ def _nsa_cp_round_robin_local_token_count(forward_batch: "ForwardBatch"):
 
 
 def _dsv4_npu_cp_value_debug_enabled(forward_batch: "ForwardBatch") -> bool:
-    if not get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG", "False"):
+    enabled = (
+        get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG", "False")
+        or get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_ALL_LAYERS", "False")
+        or bool(os.environ.get("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_LAYERS"))
+    )
+    if not enabled:
         return False
     if nsa_use_prefill_cp(forward_batch):
         return True
@@ -131,6 +164,15 @@ def _dsv4_npu_log_tensor_stats(
 ) -> None:
     if not _dsv4_npu_cp_value_debug_enabled(forward_batch):
         return
+    global _DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED
+    if not _DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED:
+        logger.warning(
+            "DSV4 NPU CP value debug active: layers=%s all_layers=%s mode=%s",
+            os.environ.get("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_LAYERS"),
+            get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_ALL_LAYERS", "False"),
+            forward_batch.forward_mode,
+        )
+        _DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED = True
     if tensor is None:
         logger.warning("DSV4 NPU CP value debug: %s is None", name)
         return
@@ -206,6 +248,63 @@ def _dsv4_npu_log_logits_stats(
         logger.warning("DSV4 NPU CP logits topk debug failed for %s: %s", name, exc)
 
 
+def _dsv4_npu_log_tensor_stats_no_batch(
+    name: str,
+    tensor: Optional[torch.Tensor],
+    *,
+    layer_id: Optional[int] = None,
+) -> None:
+    if tensor is None:
+        logger.warning("DSV4 NPU debug: %s layer=%s is None", name, layer_id)
+        return
+    try:
+        data = tensor.detach()
+        flat = data.float().reshape(-1)
+        if flat.numel() == 0:
+            logger.warning(
+                "DSV4 NPU debug: %s layer=%s shape=%s dtype=%s empty",
+                name,
+                layer_id,
+                tuple(data.shape),
+                data.dtype,
+            )
+            return
+        finite = torch.isfinite(flat)
+        finite_count = int(finite.sum().item())
+        if finite_count > 0:
+            finite_flat = flat[finite]
+            abs_mean = float(finite_flat.abs().mean().item())
+            abs_max = float(finite_flat.abs().max().item())
+            mean = float(finite_flat.mean().item())
+        else:
+            abs_mean = abs_max = mean = float("nan")
+        row_first_norm = row_last_norm = None
+        if data.ndim > 0 and data.shape[0] > 0:
+            rows = data.float().reshape(data.shape[0], -1)
+            row_first_norm = float(rows[0].norm().item())
+            row_last_norm = float(rows[-1].norm().item())
+        sample = flat[: min(6, flat.numel())].cpu().tolist()
+        logger.warning(
+            "DSV4 NPU debug: %s layer=%s shape=%s dtype=%s finite=%s/%s "
+            "mean=%.6e abs_mean=%.6e abs_max=%.6e row_norm(first,last)=%s,%s "
+            "sample=%s",
+            name,
+            layer_id,
+            tuple(data.shape),
+            data.dtype,
+            finite_count,
+            flat.numel(),
+            mean,
+            abs_mean,
+            abs_max,
+            row_first_norm,
+            row_last_norm,
+            sample,
+        )
+    except Exception as exc:
+        logger.warning("DSV4 NPU debug failed for %s layer=%s: %s", name, layer_id, exc)
+
+
 def _dsv4_npu_layer_detail_debug_enabled(
     forward_batch: "ForwardBatch",
     layer_id: int,
@@ -213,6 +312,11 @@ def _dsv4_npu_layer_detail_debug_enabled(
 ) -> bool:
     if not _dsv4_npu_cp_value_debug_enabled(forward_batch):
         return False
+    layer_filter = os.environ.get("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_LAYERS")
+    if layer_filter:
+        return _dsv4_npu_layer_filter_matches(
+            layer_filter, layer_id, num_hidden_layers
+        )
     if get_bool_env_var("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_ALL_LAYERS", "False"):
         return True
     return layer_id == 0 or layer_id == num_hidden_layers - 1
@@ -1111,6 +1215,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        *,
+        stage: str = "unknown",
     ):
 
         if x.shape[0] == 0:
@@ -1118,11 +1224,65 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
+        def hc_post_torch_impl(x, residual, post, comb):
+            return (
+                post.unsqueeze(-1) * x.unsqueeze(1)
+                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+            ).type_as(x)
+
         # NPU fast path mirroring hc_pre: torch.ops.custom.npu_hc_post is
         # the fused output replication + mixing kernel shipped in the
         # cann8.5.0-a3 image's custom_ops wheel.
         if _is_npu:
-            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            torch_layers = os.environ.get("SGLANG_DSV4_NPU_TORCH_HC_POST_LAYERS")
+            debug_layers = os.environ.get("SGLANG_DSV4_NPU_HC_POST_DEBUG_LAYERS")
+            use_torch_hc_post = _dsv4_npu_layer_filter_matches(
+                torch_layers,
+                self.layer_id,
+                self.num_hidden_layers,
+            )
+            debug_hc_post = _dsv4_npu_layer_filter_matches(
+                debug_layers,
+                self.layer_id,
+                self.num_hidden_layers,
+            ) or use_torch_hc_post
+
+            npu_out = None
+            if not use_torch_hc_post or debug_hc_post:
+                npu_out = torch.ops.custom.npu_hc_post(x, residual, post, comb)
+            if use_torch_hc_post or debug_hc_post:
+                torch_out = hc_post_torch_impl(x, residual, post, comb)
+                if debug_hc_post:
+                    log_prefix = f"hc_post.{stage}"
+                    _dsv4_npu_log_tensor_stats_no_batch(
+                        f"{log_prefix}.x", x, layer_id=self.layer_id
+                    )
+                    _dsv4_npu_log_tensor_stats_no_batch(
+                        f"{log_prefix}.residual", residual, layer_id=self.layer_id
+                    )
+                    _dsv4_npu_log_tensor_stats_no_batch(
+                        f"{log_prefix}.post", post, layer_id=self.layer_id
+                    )
+                    _dsv4_npu_log_tensor_stats_no_batch(
+                        f"{log_prefix}.comb", comb, layer_id=self.layer_id
+                    )
+                    _dsv4_npu_log_tensor_stats_no_batch(
+                        f"{log_prefix}.torch_out", torch_out, layer_id=self.layer_id
+                    )
+                    if npu_out is not None:
+                        _dsv4_npu_log_tensor_stats_no_batch(
+                            f"{log_prefix}.npu_out", npu_out, layer_id=self.layer_id
+                        )
+                        diff = (npu_out.float() - torch_out.float()).abs()
+                        _dsv4_npu_log_tensor_stats_no_batch(
+                            f"{log_prefix}.npu_minus_torch_abs",
+                            diff,
+                            layer_id=self.layer_id,
+                        )
+                if use_torch_hc_post:
+                    return torch_out
+            assert npu_out is not None
+            return npu_out
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
@@ -1132,13 +1292,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-
-        @compile_in_capture_mode
-        def hc_post_torch_impl(x, residual, post, comb):
-            return (
-                post.unsqueeze(-1) * x.unsqueeze(1)
-                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-            ).type_as(x)
 
         return hc_post_torch_impl(x, residual, post, comb)
 
@@ -1155,7 +1308,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.layer_id,
             self.num_hidden_layers,
         )
+        clone_residual = _dsv4_npu_layer_filter_matches(
+            os.environ.get("SGLANG_DSV4_NPU_CLONE_RESIDUAL_LAYERS"),
+            self.layer_id,
+            self.num_hidden_layers,
+        )
         residual = hidden_states
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.input",
+                hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
+        if clone_residual:
+            residual = residual.clone()
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_attn_fn,
@@ -1169,6 +1336,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             _dsv4_npu_log_tensor_stats(
                 "layer.attn_normed",
                 hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
+            _dsv4_npu_log_tensor_stats(
+                "layer.attn_residual_after_hc_pre",
+                residual,
                 forward_batch,
                 layer_id=self.layer_id,
             )
@@ -1186,7 +1359,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
             )
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        hidden_states = self.hc_post(
+            hidden_states, residual, post, comb, stage="attn"
+        )
         if layer_debug:
             _dsv4_npu_log_tensor_stats(
                 "layer.after_attn_hc_post",
@@ -1195,6 +1370,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
             )
         residual = hidden_states
+        if layer_debug:
+            _dsv4_npu_log_tensor_stats(
+                "layer.mlp_residual_input",
+                residual,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
+        if clone_residual:
+            residual = residual.clone()
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
             self.hc_ffn_fn,
@@ -1208,6 +1392,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             _dsv4_npu_log_tensor_stats(
                 "layer.mlp_normed",
                 hidden_states,
+                forward_batch,
+                layer_id=self.layer_id,
+            )
+            _dsv4_npu_log_tensor_stats(
+                "layer.mlp_residual_after_hc_pre",
+                residual,
                 forward_batch,
                 layer_id=self.layer_id,
             )
@@ -1284,7 +1474,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        hidden_states = self.hc_post(
+            hidden_states, residual, post, comb, stage="mlp"
+        )
         if layer_debug:
             _dsv4_npu_log_tensor_stats(
                 "layer.final",
@@ -1441,7 +1633,9 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
-            if i == self.start_layer or i == self.end_layer - 1:
+            if _dsv4_npu_layer_detail_debug_enabled(
+                forward_batch, i, len(self.layers)
+            ):
                 _dsv4_npu_log_tensor_stats(
                     "model.after_layer",
                     hidden_states,

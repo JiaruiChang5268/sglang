@@ -34,6 +34,7 @@ exact method names + arguments at first NPU forward, then fill them in.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -75,6 +76,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dsv4_npu_layer_filter() -> Optional[str]:
+    return (
+        os.environ.get("SGLANG_DSV4_NPU_CP_VERIFY_LAYERS")
+        or os.environ.get("SGLANG_DSV4_NPU_DEBUG_LAYERS")
+        or os.environ.get("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_LAYERS")
+    )
+
+
+def _dsv4_npu_should_log_layer(
+    layer_id: int,
+    num_hidden_layers: Optional[int] = None,
+) -> bool:
+    layer_filter = _dsv4_npu_layer_filter()
+    if not layer_filter:
+        return True
+    for item in layer_filter.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item == "last":
+            if num_hidden_layers is not None and layer_id == num_hidden_layers - 1:
+                return True
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if start.strip().isdigit() and end.strip().isdigit():
+                if int(start) <= layer_id <= int(end):
+                    return True
+            continue
+        if item.isdigit() and layer_id == int(item):
+            return True
+    return False
+
+
 def _stub(method_name: str):
     raise NotImplementedError(
         f"DeepseekV4AscendAttnBackend.{method_name} is not implemented yet on NPU. "
@@ -87,13 +122,14 @@ def _stub(method_name: str):
 def _dsv4_prepare_attn_sink(
     attn_sink: Optional[torch.Tensor],
     layer_id: int,
+    num_hidden_layers: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     if attn_sink is None:
         return None
 
     cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
     if get_bool_env_var("SGLANG_DSV4_NPU_ZERO_ATTN_SINK", "False"):
-        if cp_verify:
+        if cp_verify and _dsv4_npu_should_log_layer(layer_id, num_hidden_layers):
             logger.warning(
                 "DSV4 NPU uses zeroed attn_sink: layer=%s shape=%s dtype=%s",
                 layer_id,
@@ -102,7 +138,7 @@ def _dsv4_prepare_attn_sink(
             )
         return torch.zeros_like(attn_sink)
 
-    if cp_verify:
+    if cp_verify and _dsv4_npu_should_log_layer(layer_id, num_hidden_layers):
         try:
             flat = attn_sink.detach().float().reshape(-1)
             finite = torch.isfinite(flat)
@@ -231,6 +267,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_index_topk = getattr(hf, "index_topk", 512)
         self._dsv4_index_n_heads = getattr(hf, "index_n_heads", 64)
         self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
+        self._dsv4_num_hidden_layers = getattr(hf, "num_hidden_layers", None)
         self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
         self._dsv4_has_c4 = (
             self._dsv4_compress_ratios is not None and 4 in self._dsv4_compress_ratios
@@ -916,6 +953,7 @@ class DeepseekV4AscendAttnBackend(
         k: torch.Tensor,
         forward_batch: "ForwardBatch",
         default_page_table: Optional[torch.Tensor],
+        layer_id: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
         """Build the PA_ND inputs used by the original V4 NPU CP prefill path.
 
@@ -942,7 +980,15 @@ class DeepseekV4AscendAttnBackend(
 
         expected_k_rows = get_nsa_prefill_cp_total_len(forward_batch)
         if k.shape[0] != total_seq_len or expected_k_rows != total_seq_len:
-            if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            if (
+                get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+                and (
+                    layer_id is None
+                    or _dsv4_npu_should_log_layer(
+                        layer_id, self._dsv4_num_hidden_layers
+                    )
+                )
+            ):
                 logger.warning(
                     "DSV4 NPU CP keeps pool SWA inputs because gathered K does "
                     "not cover the full context: k_rows=%s, total_seq_len=%s, "
@@ -1008,7 +1054,13 @@ class DeepseekV4AscendAttnBackend(
             torch.zeros_like(ori_block_table),
         ).contiguous()
 
-        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+        if (
+            get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            and (
+                layer_id is None
+                or _dsv4_npu_should_log_layer(layer_id, self._dsv4_num_hidden_layers)
+            )
+        ):
             logger.warning(
                 "DSV4 NPU CP uses contiguous gathered K for SWA prefill: "
                 "k_rows=%s, ori_kv_shape=%s, ori_block_table_shape=%s, "
@@ -1110,7 +1162,12 @@ class DeepseekV4AscendAttnBackend(
                 probs = torch.softmax(scores, dim=-1)
             out[row_idx].copy_(torch.matmul(probs, k_visible).to(dtype=q.dtype))
 
-        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+        if (
+            get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            and _dsv4_npu_should_log_layer(
+                layer.layer_id, self._dsv4_num_hidden_layers
+            )
+        ):
             logger.warning(
                 "DSV4 CP torch dense prefill: layer=%s ratio=%s n_local=%s "
                 "q_norm=%.4f out_norm=%.4f out_max=%.4f positions=%s",
@@ -1139,12 +1196,15 @@ class DeepseekV4AscendAttnBackend(
         pool = forward_batch.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)  # (num_pages, page_size, 1, dim)
         ori_block_table = fm.swa_page_table
-        attn_sink = _dsv4_prepare_attn_sink(attn_sink, layer.layer_id)
+        attn_sink = _dsv4_prepare_attn_sink(
+            attn_sink, layer.layer_id, self._dsv4_num_hidden_layers
+        )
         if can_nsa_prefill_cp_round_robin_split(forward_batch):
             cp_ori_kv, cp_ori_block_table = self._build_cp_prefill_contiguous_swa_inputs(
                 k,
                 forward_batch,
                 fm.swa_page_table,
+                layer.layer_id,
             )
             if cp_ori_kv is not None:
                 ori_kv = cp_ori_kv
@@ -1186,11 +1246,20 @@ class DeepseekV4AscendAttnBackend(
                 forward_batch,
                 n_local,
             )
-            _cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            _cp_verify = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_VERIFY", "False"
+            ) and _dsv4_npu_should_log_layer(
+                layer.layer_id, self._dsv4_num_hidden_layers
+            )
             _torch_dense_prefill = get_bool_env_var(
                 "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL", "False"
             )
-            if _torch_dense_prefill:
+            _torch_dense_compressed_only = get_bool_env_var(
+                "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL_COMPRESSED_ONLY", "False"
+            )
+            if _torch_dense_prefill and (
+                not _torch_dense_compressed_only or compress_ratio in (4, 128)
+            ):
                 return self._forward_dense_cp_prefill_torch(
                     q,
                     ori_kv,
@@ -1207,7 +1276,7 @@ class DeepseekV4AscendAttnBackend(
             )
             if _cp_verify:
                 logger.warning(
-                    "DSV4 CP dense prefill: layer=%s ratio=%s n_local=%s "
+                    "DSV4 CP NPU dense prefill: layer=%s ratio=%s n_local=%s "
                     "ori_kv_shape=%s ori_block_table_shape=%s "
                     "q_norm=%.4f seqused_kv_min=%s seqused_kv_max=%s",
                     layer.layer_id,
@@ -1275,7 +1344,7 @@ class DeepseekV4AscendAttnBackend(
                     or row_idx % max(1, n_local // 4) == 0
                 ):
                     logger.warning(
-                        "DSV4 CP dense row: layer=%s row=%d/%d "
+                        "DSV4 CP NPU dense row: layer=%s row=%d/%d "
                         "global_q_pos=%d seqused_kv=%d batch_idx=%d "
                         "q_norm=%.4f out_norm=%.4f out_max=%.4f "
                         "out_first=%s",
@@ -1321,7 +1390,9 @@ class DeepseekV4AscendAttnBackend(
         pool = forward_batch.token_to_kv_pool
         metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
-        attn_sink = _dsv4_prepare_attn_sink(attn_sink, layer.layer_id)
+        attn_sink = _dsv4_prepare_attn_sink(
+            attn_sink, layer.layer_id, self._dsv4_num_hidden_layers
+        )
 
         if metadata is None or cmp_kv is None:
             raise RuntimeError(
@@ -1342,6 +1413,7 @@ class DeepseekV4AscendAttnBackend(
                 k,
                 forward_batch,
                 fm.swa_page_table,
+                layer.layer_id,
             )
             if cp_ori_kv is not None:
                 ori_kv = cp_ori_kv
@@ -1437,7 +1509,11 @@ class DeepseekV4AscendAttnBackend(
                 "SGLANG_DSV4_NPU_DISABLE_PA_PREFILL_CMP_KV",
                 "False",
             )
-            _cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+            _cp_verify = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_VERIFY", "False"
+            ) and _dsv4_npu_should_log_layer(
+                layer.layer_id, self._dsv4_num_hidden_layers
+            )
             _skip_row_meta = get_bool_env_var(
                 "SGLANG_DSV4_NPU_CP_SKIP_ROW_META", "False"
             )
@@ -1586,7 +1662,11 @@ class DeepseekV4AscendAttnBackend(
             cache_rows = int(swa_k.shape[0])
             loc_rows = int(swa_loc.numel())
             if cache_rows < loc_rows:
-                if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+                if get_bool_env_var(
+                    "SGLANG_DSV4_NPU_CP_VERIFY", "False"
+                ) and _dsv4_npu_should_log_layer(
+                    layer_id, self._dsv4_num_hidden_layers
+                ):
                     logger.warning(
                         "DSV4 NPU CP trims padded SWA cache locs before write: "
                         "layer_id=%s, cache_rows=%s, loc_rows=%s, "
@@ -1598,7 +1678,9 @@ class DeepseekV4AscendAttnBackend(
                         getattr(forward_batch, "extend_seq_lens_cpu", None),
                     )
                 swa_loc = swa_loc[:cache_rows]
-        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+        if get_bool_env_var(
+            "SGLANG_DSV4_NPU_CP_VERIFY", "False"
+        ) and _dsv4_npu_should_log_layer(layer_id, self._dsv4_num_hidden_layers):
             logger.warning(
                 "DSV4 store_cache: layer_id=%s swa_k_shape=%s swa_k_norm=%.4f "
                 "swa_loc_shape=%s swa_k_max=%.4f",
