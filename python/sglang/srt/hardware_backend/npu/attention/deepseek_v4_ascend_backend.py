@@ -84,12 +84,14 @@ def _dsv4_npu_layer_filter() -> Optional[str]:
     )
 
 
-def _dsv4_npu_should_log_layer(
+def _dsv4_npu_layer_filter_matches(
+    layer_filter: Optional[str],
     layer_id: int,
     num_hidden_layers: Optional[int] = None,
 ) -> bool:
-    layer_filter = _dsv4_npu_layer_filter()
     if not layer_filter:
+        return True
+    if layer_filter.strip().lower() in ("*", "all"):
         return True
     for item in layer_filter.split(","):
         item = item.strip()
@@ -108,6 +110,15 @@ def _dsv4_npu_should_log_layer(
         if item.isdigit() and layer_id == int(item):
             return True
     return False
+
+
+def _dsv4_npu_should_log_layer(
+    layer_id: int,
+    num_hidden_layers: Optional[int] = None,
+) -> bool:
+    return _dsv4_npu_layer_filter_matches(
+        _dsv4_npu_layer_filter(), layer_id, num_hidden_layers
+    )
 
 
 def _stub(method_name: str):
@@ -1388,13 +1399,25 @@ class DeepseekV4AscendAttnBackend(
         """
         fm = self.forward_metadata
         pool = forward_batch.token_to_kv_pool
-        metadata = fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
-        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+        disable_prefill_cmp_kv = get_bool_env_var(
+            "SGLANG_DSV4_NPU_DISABLE_PA_PREFILL_CMP_KV",
+            "False",
+        )
+        metadata = (
+            fm.kernel_metadata["c1a_metadata"]
+            if disable_prefill_cmp_kv
+            else fm.kernel_metadata.get(f"c{compress_ratio}a_metadata")
+        )
+        cmp_kv = (
+            pool.get_swa_buffer(layer.layer_id)
+            if disable_prefill_cmp_kv
+            else pool.get_compress_buffer(layer.layer_id, False)
+        )
         attn_sink = _dsv4_prepare_attn_sink(
             attn_sink, layer.layer_id, self._dsv4_num_hidden_layers
         )
 
-        if metadata is None or cmp_kv is None:
+        if not disable_prefill_cmp_kv and (metadata is None or cmp_kv is None):
             raise RuntimeError(
                 "DeepseekV4AscendAttnBackend._forward_compressed: missing "
                 f"required state for layer_id={layer.layer_id} "
@@ -1468,6 +1491,19 @@ class DeepseekV4AscendAttnBackend(
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
         )
+        c1_attn_kwargs = {
+            key: value
+            for key, value in attn_kwargs.items()
+            if key
+            not in (
+                "cmp_ratio",
+                "cmp_mask_mode",
+                "cmp_kv",
+                "cmp_sparse_indices",
+                "cmp_block_table",
+            )
+        }
+        c1_attn_kwargs["metadata"] = fm.kernel_metadata["c1a_metadata"]
         # Step-5c diagnosis: route c4 with cmp_sparse_indices=None (= same
         # treatment as c128) when SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK is set.
         # This bypasses the -1 sentinel topk path that was used to "mask"
@@ -1479,7 +1515,20 @@ class DeepseekV4AscendAttnBackend(
         # diverges from dense baseline, the issue is in compressor write
         # values (ape/wkv split) or in lingering pool state.
 
-        if compress_ratio == 4 and not envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
+        c4_no_topk = envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get()
+        cp_round_robin_prefill = can_nsa_prefill_cp_round_robin_split(forward_batch)
+        # real_indexer is read here for visibility in the CP verify log only.
+        # The actual behavior gate (sentinel vs real topk) lives in
+        # indexer.py forward_npu line ~710: the indexer short-circuits to
+        # -1 sentinel when REAL_INDEXER=0, so fm.c4_topk_indices already
+        # reflects the right topk before _forward_compressed is entered.
+        real_indexer = envs.SGLANG_DSV4_NPU_REAL_INDEXER.get()
+        if (
+            not disable_prefill_cmp_kv
+            and compress_ratio == 4
+            and not c4_no_topk
+            and not cp_round_robin_prefill
+        ):
             topk = fm.c4_topk_indices
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
@@ -1487,7 +1536,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+        if cp_round_robin_prefill:
             if q.shape[0] == 0:
                 return q
             n_local = q.shape[0]
@@ -1509,6 +1558,26 @@ class DeepseekV4AscendAttnBackend(
                 "SGLANG_DSV4_NPU_DISABLE_PA_PREFILL_CMP_KV",
                 "False",
             )
+            _torch_dense_prefill = get_bool_env_var(
+                "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL", "False"
+            )
+            _torch_dense_compressed_only = get_bool_env_var(
+                "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL_COMPRESSED_ONLY", "False"
+            )
+            if _torch_dense_prefill and (
+                not _torch_dense_compressed_only or compress_ratio in (4, 128)
+            ):
+                return self._forward_dense_cp_prefill_torch(
+                    q,
+                    ori_kv,
+                    layer,
+                    forward_batch,
+                    local_positions,
+                    local_seqused_kv,
+                    row_batch_indices,
+                    attn_sink,
+                    compress_ratio,
+                )
             _cp_verify = get_bool_env_var(
                 "SGLANG_DSV4_NPU_CP_VERIFY", "False"
             ) and _dsv4_npu_should_log_layer(
@@ -1517,11 +1586,87 @@ class DeepseekV4AscendAttnBackend(
             _skip_row_meta = get_bool_env_var(
                 "SGLANG_DSV4_NPU_CP_SKIP_ROW_META", "False"
             )
+            _assert_finite = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_ASSERT_FINITE", "False"
+            )
+            _compare_cmp_to_c1 = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_COMPARE_CMP_TO_C1", "False"
+            )
+            _enable_c4_cmp = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_ENABLE_C4_COMPRESSED", "False"
+            ) and _dsv4_npu_layer_filter_matches(
+                os.environ.get("SGLANG_DSV4_NPU_CP_ENABLE_C4_COMPRESSED_LAYERS"),
+                layer.layer_id,
+                self._dsv4_num_hidden_layers,
+            )
+            _enable_c128_cmp = get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_ENABLE_C128_COMPRESSED", "False"
+            ) and _dsv4_npu_layer_filter_matches(
+                os.environ.get("SGLANG_DSV4_NPU_CP_ENABLE_C128_COMPRESSED_LAYERS"),
+                layer.layer_id,
+                self._dsv4_num_hidden_layers,
+            )
+            _c1_torch_fallback = disable_prefill_cmp_kv or get_bool_env_var(
+                "SGLANG_DSV4_NPU_CP_C1_TORCH_FALLBACK", "False"
+            ) or (
+                compress_ratio == 4 and not _enable_c4_cmp
+            ) or (
+                compress_ratio == 128 and not _enable_c128_cmp
+            )
+            max_window_start = max(
+                0,
+                int(local_seqused_kv.max().item()) - self._dsv4_sliding_window_size,
+            )
+            max_cmp_valid_tokens = max_window_start // compress_ratio
+            if max_cmp_valid_tokens == 0:
+                if _cp_verify:
+                    logger.warning(
+                        "DSV4 CP compressed prefill uses torch dense because "
+                        "no compressed history is visible: layer=%s ratio=%s "
+                        "n_local=%s max_window_start=%s max_cmp_valid=%s",
+                        layer.layer_id,
+                        compress_ratio,
+                        n_local,
+                        max_window_start,
+                        max_cmp_valid_tokens,
+                    )
+                return self._forward_dense_cp_prefill_torch(
+                    q,
+                    ori_kv,
+                    layer,
+                    forward_batch,
+                    local_positions,
+                    local_seqused_kv,
+                    row_batch_indices,
+                    attn_sink,
+                    compress_ratio,
+                )
+            if (
+                not disable_prefill_cmp_kv
+                and compress_ratio == 4
+                and not c4_no_topk
+            ):
+                topk = fm.c4_topk_indices
+                if topk is None:
+                    topk = self._seed_c4_topk_indices(forward_batch)
+                    fm.c4_topk_indices = topk
+                attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
+            else:
+                attn_kwargs["cmp_sparse_indices"] = None
+            topk_for_rows = attn_kwargs.get("cmp_sparse_indices")  # (bs, 1, topk_k) or None
+            topk_rows = None
+            topk_valid = None
+            if topk_for_rows is not None:
+                topk_rows = int(topk_for_rows.shape[0])
+                topk_valid = int((topk_for_rows >= 0).sum().item())
             if _cp_verify:
                 logger.warning(
                     "DSV4 CP compressed prefill: layer=%s ratio=%s n_local=%s "
-                    "ori_kv_shape=%s ori_block_table_shape=%s "
-                    "q_norm=%.4f seqused_kv_min=%s seqused_kv_max=%s",
+                    "ori_kv_shape=%s ori_block_table_shape=%s q_norm=%.4f "
+                    "seqused_kv_min=%s seqused_kv_max=%s c1_torch_fallback=%s "
+                    "disable_cmp=%s c4_no_topk=%s real_indexer=%s "
+                    "enable_c4_cmp=%s enable_c128_cmp=%s "
+                    "topk_rows=%s topk_valid=%s",
                     layer.layer_id,
                     compress_ratio,
                     n_local,
@@ -1530,8 +1675,16 @@ class DeepseekV4AscendAttnBackend(
                     float(q.float().norm().item()),
                     int(local_seqused_kv.min().item()),
                     int(local_seqused_kv.max().item()),
+                    _c1_torch_fallback,
+                    disable_prefill_cmp_kv,
+                    c4_no_topk,
+                    real_indexer,
+                    _enable_c4_cmp,
+                    _enable_c128_cmp,
+                    topk_rows,
+                    topk_valid,
                 )
-            topk_for_rows = attn_kwargs.get("cmp_sparse_indices")  # (bs, 1, topk_k) or None
+            torch_c1_out = None
             out = torch.empty_like(q)
             for row_idx in range(n_local):
                 row_seq_len = int(local_seqused_kv[row_idx].item())
@@ -1554,14 +1707,49 @@ class DeepseekV4AscendAttnBackend(
                     device=q.device,
                 )
                 # Determine whether this specific row has compressed KV.
+                topk_row = None
+                row_window_start = max(
+                    0, row_seq_len - self._dsv4_sliding_window_size
+                )
+                # Compressed KV should cover only history outside the original
+                # sliding window. Blocks that overlap the SWA window would
+                # duplicate visible context and change short-prompt outputs.
+                row_cmp_valid_tokens = row_window_start // compress_ratio
                 if disable_prefill_cmp_kv:
                     row_has_cmp = False
+                elif compress_ratio == 4 and not _enable_c4_cmp:
+                    # C4 CP prefill is still being adapted. Even when topk is
+                    # present, keep it behind an explicit switch until the
+                    # compressed row contract is proven stable.
+                    row_has_cmp = False
                 elif compress_ratio == 4 and topk_for_rows is not None:
-                    row_has_cmp = bool(
-                        (topk_for_rows[batch_idx : batch_idx + 1] >= 0).any().item()
+                    if row_idx >= topk_for_rows.shape[0]:
+                        raise RuntimeError(
+                            "DSV4 CP C4 topk rows are fewer than local q rows: "
+                            f"layer={layer.layer_id}, topk_rows={topk_for_rows.shape[0]}, "
+                            f"q_rows={n_local}, row_idx={row_idx}."
+                        )
+                    topk_row = topk_for_rows[row_idx : row_idx + 1].clone()
+                    # The indexer sees the full prefill chunk, but each query row
+                    # has its own causal boundary. Drop compressed block indices
+                    # that are not visible to this row yet.
+                    topk_row.masked_fill_(topk_row >= row_cmp_valid_tokens, -1)
+                    row_has_cmp = row_cmp_valid_tokens > 0 and bool(
+                        (topk_row >= 0).any().item()
                     )
+                elif compress_ratio == 4:
+                    # C4 needs explicit sparse indices. The diagnostic
+                    # cmp_sparse_indices=None path is not numerically stable in
+                    # CP prefill; keep the row on C1 fallback until real indexer
+                    # topk is available.
+                    row_has_cmp = False
+                elif compress_ratio == 128 and not _enable_c128_cmp:
+                    # C128 CP prefill is still being adapted. Keep it behind an
+                    # explicit switch so normal runs cannot enter the unstable
+                    # compressed row path by length alone.
+                    row_has_cmp = False
                 else:
-                    row_has_cmp = row_seq_len >= compress_ratio
+                    row_has_cmp = row_cmp_valid_tokens > 0
                 metadata_key = (
                     f"c{compress_ratio}a_metadata" if row_has_cmp else "c1a_metadata"
                 )
@@ -1584,7 +1772,7 @@ class DeepseekV4AscendAttnBackend(
                         row_metadata = fm.kernel_metadata.get(
                             metadata_key, fm.kernel_metadata["c1a_metadata"]
                         )
-                row_attn_kwargs = dict(attn_kwargs)
+                row_attn_kwargs = dict(attn_kwargs if row_has_cmp else c1_attn_kwargs)
                 row_attn_kwargs.update(
                     {
                         "cu_seqlens_q": row_cu_seqlens_q,
@@ -1603,22 +1791,78 @@ class DeepseekV4AscendAttnBackend(
                             "cmp_block_table"
                         ][batch_idx : batch_idx + 1]
                     # Per-row topk indices: slice to (1, 1, topk_k).
-                    if topk_for_rows is not None:
-                        row_attn_kwargs["cmp_sparse_indices"] = topk_for_rows[
-                            batch_idx : batch_idx + 1
-                        ]
+                    if topk_row is not None:
+                        row_attn_kwargs["cmp_sparse_indices"] = topk_row
+                if not row_has_cmp and _c1_torch_fallback:
+                    if torch_c1_out is None:
+                        torch_c1_out = self._forward_dense_cp_prefill_torch(
+                            q,
+                            ori_kv,
+                            layer,
+                            forward_batch,
+                            local_positions,
+                            local_seqused_kv,
+                            row_batch_indices,
+                            attn_sink,
+                            compress_ratio,
+                        )
+                    row_out = torch_c1_out[row_idx : row_idx + 1]
+                    row_source = "torch_c1"
                 else:
-                    for key in (
-                        "cmp_ratio",
-                        "cmp_mask_mode",
-                        "cmp_kv",
-                        "cmp_sparse_indices",
-                        "cmp_block_table",
-                    ):
-                        row_attn_kwargs.pop(key, None)
-                row_out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
-                    **row_attn_kwargs
-                )
+                    row_out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(
+                        **row_attn_kwargs
+                    )
+                    row_source = "npu_cmp" if row_has_cmp else "npu_c1"
+                if row_has_cmp and _compare_cmp_to_c1 and _cp_verify:
+                    if torch_c1_out is None:
+                        torch_c1_out = self._forward_dense_cp_prefill_torch(
+                            q,
+                            ori_kv,
+                            layer,
+                            forward_batch,
+                            local_positions,
+                            local_seqused_kv,
+                            row_batch_indices,
+                            attn_sink,
+                            compress_ratio,
+                        )
+                    row_ref = torch_c1_out[row_idx : row_idx + 1]
+                    row_diff = (row_out.float() - row_ref.float()).abs()
+                    topk_sample = None
+                    if topk_row is not None:
+                        topk_sample = (
+                            topk_row.reshape(-1)[: min(8, topk_row.numel())]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                    logger.warning(
+                        "DSV4 CP compressed compare: layer=%s ratio=%s "
+                        "row=%d/%d global_q_pos=%d seqused_kv=%d win_start=%d "
+                        "cmp_valid=%d "
+                        "topk=%s npu_norm=%.4f c1_norm=%.4f "
+                        "diff_mean=%.6e diff_max=%.6e",
+                        layer.layer_id,
+                        compress_ratio,
+                        row_idx,
+                        n_local,
+                        row_global_q_pos,
+                        row_seq_len,
+                        row_window_start,
+                        row_cmp_valid_tokens,
+                        topk_sample,
+                        float(row_out.float().norm().item()),
+                        float(row_ref.float().norm().item()),
+                        float(row_diff.mean().item()),
+                        float(row_diff.max().item()),
+                    )
+                if _assert_finite and not bool(torch.isfinite(row_out.float()).all().item()):
+                    raise RuntimeError(
+                        "DSV4 CP compressed row produced non-finite output: "
+                        f"layer={layer.layer_id}, ratio={compress_ratio}, "
+                        f"row={row_idx}/{n_local}, global_q_pos={row_global_q_pos}, "
+                        f"seqused_kv={row_seq_len}, has_cmp={row_has_cmp}."
+                    )
                 if _cp_verify and (
                     row_idx == 0
                     or row_idx == n_local - 1
@@ -1626,7 +1870,8 @@ class DeepseekV4AscendAttnBackend(
                 ):
                     logger.warning(
                         "DSV4 CP compressed row: layer=%s ratio=%s "
-                        "row=%d/%d global_q_pos=%d seqused_kv=%d has_cmp=%s "
+                        "row=%d/%d global_q_pos=%d seqused_kv=%d win_start=%d "
+                        "cmp_valid=%d has_cmp=%s source=%s "
                         "q_norm=%.4f out_norm=%.4f out_max=%.4f",
                         layer.layer_id,
                         compress_ratio,
@@ -1634,13 +1879,27 @@ class DeepseekV4AscendAttnBackend(
                         n_local,
                         row_global_q_pos,
                         row_seq_len,
+                        row_window_start,
+                        row_cmp_valid_tokens,
                         row_has_cmp,
+                        row_source,
                         float(q[row_idx].float().norm().item()),
                         float(row_out.float().norm().item()),
                         float(row_out.float().abs().max().item()),
                     )
                 out[row_idx : row_idx + 1].copy_(row_out)
             return out
+        if disable_prefill_cmp_kv:
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs["metadata"] = fm.kernel_metadata["c1a_metadata"]
+            for key in (
+                "cmp_ratio",
+                "cmp_mask_mode",
+                "cmp_kv",
+                "cmp_sparse_indices",
+                "cmp_block_table",
+            ):
+                attn_kwargs.pop(key, None)
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 

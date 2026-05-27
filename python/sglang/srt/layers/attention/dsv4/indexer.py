@@ -574,6 +574,7 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        positions: Optional[torch.Tensor] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
@@ -587,7 +588,7 @@ class C4Indexer(nn.Module):
             # the backend's forward_metadata for _forward_compressed to pick
             # up. CUDA path delegates to the triton + deep_gemm pipeline in
             # the backend mixin below.
-            topk_idxs = self.forward_npu(x, q_lora, forward_batch)
+            topk_idxs = self.forward_npu(x, q_lora, forward_batch, positions=positions)
             forward_batch.attn_backend.forward_metadata.c4_topk_indices = topk_idxs
             return None
         if TYPE_CHECKING:
@@ -640,6 +641,7 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute c4 top-k sparse indices on NPU; returns a [T, index_topk]
         int32 tensor.
@@ -666,9 +668,19 @@ class C4Indexer(nn.Module):
             and not forward_batch.forward_mode.is_target_verify()
         )
         use_prefill_cp = can_nsa_prefill_cp_round_robin_split(forward_batch)
-        positions = forward_batch.positions
+        positions = forward_batch.positions if positions is None else positions
         if use_prefill_cp and positions.shape[0] != x.shape[0]:
             positions = nsa_cp_round_robin_split_data(positions)
+        if positions.shape[0] > x.shape[0]:
+            # The global batch may contain CP padding rows. The model path
+            # trims hidden states before entering layers; keep indexer RoPE
+            # positions aligned with the real local rows.
+            positions = positions[: x.shape[0]].contiguous()
+        elif positions.shape[0] < x.shape[0]:
+            raise RuntimeError(
+                "DSV4 NPU indexer positions are shorter than local rows: "
+                f"positions={positions.shape[0]}, x_rows={x.shape[0]}."
+            )
 
         # q path
         q = self._compute_q_npu(q_lora, positions)
@@ -738,9 +750,22 @@ class C4Indexer(nn.Module):
 
         # bf16 li_kv path: per-request einsum + topk against the indexer
         # compress buffer — slow but architecture-faithful fallback.
+        # Guard: c4_page_table is set only when SGLANG_DSV4_NPU_REAL_COMPRESSOR=1
+        # runs _build_npu_compress_metadata. If it's absent (compressor not yet
+        # enabled), return the -1 sentinel so _forward_compressed treats every
+        # row as C1 rather than crashing with AttributeError.
+        page_table = getattr(
+            forward_batch.attn_backend.forward_metadata, "c4_page_table", None
+        )
+        if page_table is None:
+            return torch.full(
+                (bs, self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
         seqlens_cpu = forward_batch.seq_lens_cpu
         end_pos = forward_batch.seq_lens.cumsum(dim=0)
-        page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
         attn_tp_size = get_attention_tp_size()
         local_seq_lens_cpu = None
         local_q_offset = 0

@@ -113,6 +113,8 @@ def _dsv4_npu_layer_filter_matches(
         item = item.strip()
         if not item:
             continue
+        if item in ("*", "all"):
+            return True
         if item == "last":
             if num_hidden_layers is not None and layer_id == num_hidden_layers - 1:
                 return True
@@ -126,6 +128,154 @@ def _dsv4_npu_layer_filter_matches(
         if item.isdigit() and layer_id == int(item):
             return True
     return False
+
+
+def _dsv4_npu_layer_filter_allows(
+    layer_filter: Optional[str],
+    layer_id: int,
+    num_hidden_layers: Optional[int] = None,
+) -> bool:
+    return not layer_filter or _dsv4_npu_layer_filter_matches(
+        layer_filter, layer_id, num_hidden_layers
+    )
+
+
+def _dsv4_npu_to_int_list(value) -> Optional[List[int]]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.reshape(-1).cpu().tolist()]
+    return [int(item) for item in value]
+
+
+def _dsv4_npu_cp_max_visible_seq_len(
+    forward_batch: "ForwardBatch",
+    positions: Optional[torch.Tensor] = None,
+) -> int:
+    if positions is not None and positions.numel() > 0:
+        return int(positions.detach().max().item()) + 1
+
+    extend_lens = _dsv4_npu_to_int_list(
+        getattr(forward_batch, "extend_seq_lens_cpu", None)
+    )
+    if extend_lens is not None:
+        prefix_lens = _dsv4_npu_to_int_list(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        )
+        if prefix_lens is not None and len(prefix_lens) == len(extend_lens):
+            return max(
+                (prefix + extend for prefix, extend in zip(prefix_lens, extend_lens)),
+                default=0,
+            )
+        return max(extend_lens, default=0)
+
+    seq_lens_cpu = _dsv4_npu_to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
+    if seq_lens_cpu is not None:
+        return max(seq_lens_cpu, default=0)
+
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    if seq_lens is None:
+        return 0
+    return int(seq_lens.max().item()) if seq_lens.numel() else 0
+
+
+def _dsv4_npu_cp_compress_enabled_for_layer(
+    compress_ratio: int,
+    layer_id: int,
+    forward_batch: "ForwardBatch",
+    sliding_window_size: int,
+    num_hidden_layers: Optional[int] = None,
+    positions: Optional[torch.Tensor] = None,
+) -> bool:
+    if compress_ratio == 4:
+        enabled = get_bool_env_var(
+            "SGLANG_DSV4_NPU_CP_ENABLE_C4_COMPRESSED", "False"
+        )
+        layer_filter = os.environ.get("SGLANG_DSV4_NPU_CP_ENABLE_C4_COMPRESSED_LAYERS")
+    elif compress_ratio == 128:
+        enabled = get_bool_env_var(
+            "SGLANG_DSV4_NPU_CP_ENABLE_C128_COMPRESSED", "False"
+        )
+        layer_filter = os.environ.get(
+            "SGLANG_DSV4_NPU_CP_ENABLE_C128_COMPRESSED_LAYERS"
+        )
+    else:
+        return False
+
+    if not enabled or not _dsv4_npu_layer_filter_allows(
+        layer_filter, layer_id, num_hidden_layers
+    ):
+        return False
+
+    max_seq_len = _dsv4_npu_cp_max_visible_seq_len(forward_batch, positions)
+    window_start = max(0, max_seq_len - sliding_window_size)
+    return window_start // compress_ratio > 0
+
+
+def _dsv4_npu_sync_probe(point: str, layer_id: Optional[int] = None) -> None:
+    sync_points = os.environ.get("SGLANG_DSV4_NPU_SYNC_POINTS")
+    if not (_is_npu and sync_points):
+        return
+    enabled = {item.strip() for item in sync_points.split(",") if item.strip()}
+    if point not in enabled and "all" not in enabled:
+        return
+    layer_filter = os.environ.get("SGLANG_DSV4_NPU_SYNC_LAYERS")
+    if layer_id is not None and layer_filter:
+        if not _dsv4_npu_layer_filter_matches(layer_filter, int(layer_id)):
+            return
+    torch.get_device_module().synchronize()
+
+
+def _dsv4_npu_touch_value_debug_enabled(
+    name: str,
+    forward_batch: "ForwardBatch",
+    layer_id: Optional[int],
+) -> bool:
+    if not _is_npu:
+        return False
+    layer_filter = os.environ.get("SGLANG_DSV4_NPU_TOUCH_VALUE_DEBUG_LAYERS")
+    names_filter = os.environ.get("SGLANG_DSV4_NPU_TOUCH_VALUE_DEBUG_NAMES")
+    if not layer_filter and not names_filter:
+        return False
+    if forward_batch.forward_mode.is_decode() and not get_bool_env_var(
+        "SGLANG_DSV4_NPU_TOUCH_VALUE_DEBUG_DECODE", "False"
+    ):
+        return False
+    if layer_filter and layer_id is not None:
+        num_hidden_layers = getattr(
+            getattr(forward_batch, "model_runner", None),
+            "num_layers",
+            None,
+        )
+        if not _dsv4_npu_layer_filter_matches(
+            layer_filter,
+            int(layer_id),
+            num_hidden_layers,
+        ):
+            return False
+    if names_filter:
+        enabled_names = {item.strip() for item in names_filter.split(",") if item.strip()}
+        if name not in enabled_names and "all" not in enabled_names:
+            return False
+    return True
+
+
+def _dsv4_npu_touch_tensor(tensor: Optional[torch.Tensor]) -> None:
+    if tensor is None:
+        torch.get_device_module().synchronize()
+        return
+    data = tensor.detach()
+    flat = data.float().reshape(-1)
+    if flat.numel() == 0:
+        torch.get_device_module().synchronize()
+        return
+    finite = torch.isfinite(flat)
+    _ = int(finite.sum().item())
+    if data.ndim > 0 and data.shape[0] > 0:
+        rows = data.float().reshape(data.shape[0], -1)
+        _ = float(rows[0].norm().item())
+        _ = float(rows[-1].norm().item())
+    _ = flat[: min(6, flat.numel())].cpu().tolist()
 
 
 def _nsa_cp_round_robin_local_token_count(forward_batch: "ForwardBatch"):
@@ -162,8 +312,44 @@ def _dsv4_npu_log_tensor_stats(
     *,
     layer_id: Optional[int] = None,
 ) -> None:
+    touch_enabled = _dsv4_npu_touch_value_debug_enabled(
+        name, forward_batch, layer_id
+    )
     if not _dsv4_npu_cp_value_debug_enabled(forward_batch):
+        if touch_enabled:
+            try:
+                _dsv4_npu_touch_tensor(tensor)
+            except Exception as exc:
+                logger.warning(
+                    "DSV4 NPU touch value debug failed for %s layer=%s: %s",
+                    name,
+                    layer_id,
+                    exc,
+                )
         return
+    layer_filter = os.environ.get("SGLANG_DSV4_NPU_CP_VALUE_DEBUG_LAYERS")
+    if layer_id is not None and layer_filter:
+        num_hidden_layers = getattr(
+            getattr(forward_batch, "model_runner", None),
+            "num_layers",
+            None,
+        )
+        if not _dsv4_npu_layer_filter_matches(
+            layer_filter,
+            int(layer_id),
+            num_hidden_layers,
+        ):
+            if touch_enabled:
+                try:
+                    _dsv4_npu_touch_tensor(tensor)
+                except Exception as exc:
+                    logger.warning(
+                        "DSV4 NPU touch value debug failed for %s layer=%s: %s",
+                        name,
+                        layer_id,
+                        exc,
+                    )
+            return
     global _DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED
     if not _DSV4_NPU_CP_VALUE_DEBUG_CONFIG_LOGGED:
         logger.warning(
@@ -350,6 +536,12 @@ def _v4_rope_inplace_npu(
     fallback some prompts (those with marginal argmax decisions) flip
     tokens vs iforgetmyname.
     """
+    if positions.shape[0] != q_rope.shape[0]:
+        raise RuntimeError(
+            "DeepSeek V4 NPU RoPE position rows must match q rows: "
+            f"positions={positions.shape[0]}, q_rows={q_rope.shape[0]}, "
+            f"q_shape={tuple(q_rope.shape)}, inverse={inverse}."
+        )
     if (
         _is_npu
         and hasattr(torch.ops, "custom")
@@ -539,6 +731,12 @@ class MQALayer(nn.Module):
             128,
         ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
         self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
+        self.num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        self.sliding_window_size = (
+            config.sliding_window_size
+            if getattr(config, "sliding_window_size", None) is not None
+            else 128
+        )
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -800,6 +998,7 @@ class MQALayer(nn.Module):
                 self.indexer(
                     x=x,
                     q_lora=q_lora,
+                    positions=positions,
                     forward_batch=forward_batch,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
@@ -899,6 +1098,7 @@ class MQALayer(nn.Module):
                 forward_batch,
                 get_current_device_stream_fast(),
             )
+            _dsv4_npu_sync_probe("mqa.cp_gather_kv", self.layer_id)
             _dsv4_npu_log_tensor_stats(
                 "mqa.gathered_kv",
                 kv,
@@ -912,10 +1112,52 @@ class MQALayer(nn.Module):
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
+            _dsv4_npu_sync_probe("mqa.store_cache", self.layer_id)
 
-        if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
-        if self.compressor is not None:
+        skip_cp_compressor = (
+            _is_npu
+            and self.nsa_enable_prefill_cp
+            and nsa_use_prefill_cp(forward_batch)
+            and is_nsa_prefill_cp_round_robin_split()
+            and self.compress_ratio in (4, 128)
+            and not _dsv4_npu_cp_compress_enabled_for_layer(
+                self.compress_ratio,
+                self.layer_id,
+                forward_batch,
+                self.sliding_window_size,
+                self.num_hidden_layers,
+                positions,
+            )
+        )
+        if skip_cp_compressor and get_bool_env_var(
+            "SGLANG_DSV4_NPU_CP_VERIFY", "False"
+        ):
+            max_visible_seq_len = _dsv4_npu_cp_max_visible_seq_len(
+                forward_batch, positions
+            )
+            logger.warning(
+                "DSV4 NPU CP skips compressor/indexer: layer=%s ratio=%s "
+                "sliding_window=%s max_visible_seq_len=%s",
+                self.layer_id,
+                self.compress_ratio,
+                self.sliding_window_size,
+                max_visible_seq_len,
+            )
+
+        if self.indexer is not None and not skip_cp_compressor:
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+            _dsv4_npu_sync_probe("mqa.indexer", self.layer_id)
+        elif self.indexer is not None and skip_cp_compressor:
+            try:
+                attn_backend.forward_metadata.c4_topk_indices = None
+            except AttributeError:
+                pass
+        if self.compressor is not None and not skip_cp_compressor:
             compressor_x = x
             if (
                 self.nsa_enable_prefill_cp
@@ -933,12 +1175,14 @@ class MQALayer(nn.Module):
                     forward_batch,
                     get_current_device_stream_fast(),
                 )
+                _dsv4_npu_sync_probe("mqa.compressor_cp_gather", self.layer_id)
             attn_backend.forward_core_compressor(
                 compressor_x,
                 forward_batch,
                 self.layer_id,
                 self.compressor,
             )
+            _dsv4_npu_sync_probe("mqa.core_compressor", self.layer_id)
 
         if q_out is not None:
             q_out.copy_(q)
@@ -991,6 +1235,7 @@ class MQALayer(nn.Module):
             attn_sink=self.attn_sink,
             save_kv_cache=not self.overlap_store_cache,
         )
+        _dsv4_npu_sync_probe("mqa.attn_out", self.layer_id)
         _dsv4_npu_log_tensor_stats(
             "mqa.attn_out",
             o,
