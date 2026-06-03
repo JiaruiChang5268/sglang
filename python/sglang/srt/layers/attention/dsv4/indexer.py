@@ -718,6 +718,21 @@ class C4Indexer(nn.Module):
 
         # Prefer the fused int8 lightning indexer when the indexer KV is
         # quantized (matches iforgetmyname's li_kv_dtype == "int8" branch).
+        #
+        # WHY `not use_prefill_cp`: _forward_npu_fused passes
+        #   actual_seq_lengths_query=[n_local]  (cumulative token count)
+        #   actual_seq_lengths_key=[S]           (full KV length)
+        # and lets the kernel infer Q positions from those — which assumes
+        # Q tokens occupy consecutive positions 0..n_local-1.  In round-robin
+        # CP, the local Q tokens are at stride-cp_size global positions
+        # (cp_rank, cp_rank+cp_size, ...), so the kernel's built-in causal
+        # mask becomes wrong for all but the last CP rank.
+        #
+        # The bf16 einsum loop below (lines ~800-840) already handles CP
+        # correctly by reading the actual global positions from
+        # `positions[start:end]` and using them in the causal mask.
+        # To enable the fused path for CP, the kernel interface would need
+        # a per-Q-row position tensor — a kernel API change, not a Python fix.
         li_kv_dtype = getattr(self.compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8" and not use_prefill_cp:
             # Step-5e: skip the indexer kernel call when this rank's batch

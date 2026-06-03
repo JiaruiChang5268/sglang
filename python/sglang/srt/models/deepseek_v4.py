@@ -152,7 +152,21 @@ def _dsv4_npu_cp_max_visible_seq_len(
     forward_batch: "ForwardBatch",
     positions: Optional[torch.Tensor] = None,
 ) -> int:
-    if positions is not None and positions.numel() > 0:
+    # Under round-robin CP prefill, `positions` is the rank-LOCAL strided slice
+    # (rank r sees global positions r, r+cp_size, r+2*cp_size, ...), so
+    # positions.max() differs across ranks (e.g. cp_size=2, 8 tokens: rank0
+    # max=6, rank1 max=7).  Feeding that into the compress gate
+    # (_dsv4_npu_cp_compress_enabled_for_layer) makes the gate diverge across
+    # ranks at a chunk boundary -> one rank runs the compressor/indexer
+    # all-gather collective while another skips it -> CP-group hang.  Skip the
+    # local positions and fall through to the GLOBAL extend/prefix lengths,
+    # which are broadcast rank-invariant (extend_seq_lens_cpu is identical on
+    # every CP rank), so the gate decision is the same everywhere.
+    if (
+        positions is not None
+        and positions.numel() > 0
+        and not is_nsa_prefill_cp_round_robin_split()
+    ):
         return int(positions.detach().max().item()) + 1
 
     extend_lens = _dsv4_npu_to_int_list(
@@ -208,8 +222,25 @@ def _dsv4_npu_cp_compress_enabled_for_layer(
         return False
 
     max_seq_len = _dsv4_npu_cp_max_visible_seq_len(forward_batch, positions)
-    window_start = max(0, max_seq_len - sliding_window_size)
-    return window_start // compress_ratio > 0
+    # `sliding_window_size` is intentionally no longer used below (kept in the
+    # signature for call-site API compatibility; see the old `window_start` logic
+    # that was removed and explained in the comment block below).
+    _ = sliding_window_size
+    # Run the compressor whenever at least one complete chunk exists
+    # (max_seq_len >= compress_ratio), regardless of where the SWA window falls.
+    #
+    # Previously this tested `window_start // compress_ratio > 0`, which returns
+    # False whenever the whole sequence fits inside the SWA window (window_start=0).
+    # That caused skip_cp_compressor=True during prefill for short sequences, so
+    # the C4 attention buffer and C4 indexer buffer were never written.  Subsequent
+    # decode steps then read from those zero-initialised buffers, producing either
+    # wrong tokens (short sequences) or all-zero token IDs (long sequences).
+    #
+    # The SWA window check is irrelevant here: even if all compressed chunks fall
+    # inside the current SWA window, they will be needed by decode once the sequence
+    # grows past the window.  If we skip writing them during prefill they can never
+    # be recovered (decode compressor only writes new boundary-aligned chunks).
+    return (max_seq_len // compress_ratio) > 0
 
 
 def _dsv4_npu_sync_probe(point: str, layer_id: Optional[int] = None) -> None:

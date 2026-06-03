@@ -310,7 +310,6 @@ class DeepseekV4AscendAttnBackend(
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
         self.dsv4_cp_prefill_row_kernel_metadata = {}
-        self.dsv4_cp_prefill_batch_kernel_metadata = {}
         cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
         if cp_verify and not self._dsv4_cp_verify_init_metadata_logged:
             from sglang.srt.layers.attention.nsa.utils import (
@@ -452,8 +451,17 @@ class DeepseekV4AscendAttnBackend(
         # Build kernel_metadata dict. For V4-Flash we mainly need c1a (no
         # compress KV) right now; c4a/c128a follow when we add those paths.
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
+        # CP round-robin prefill issues ONE npu_sparse_attn_sharedkv call per
+        # local Q row (see _forward_dense).  Round-robin gives each rank
+        # strided positions, so every local row has a distinct causal boundary
+        # and there is no correct single batched call on the current CANN
+        # kernel: batching n_local length-1 virtual requests that share the
+        # gathered global KV pages makes the kernel address KV batch-major and
+        # walk off the shared buffer (aicore MTE "DDR address out of range",
+        # errcode 507015, confirmed under ASCEND_LAUNCH_BLOCKING).  The
+        # architecturally faster shape (one contiguous causal call per rank)
+        # requires the in-seq-split CP mode, which is not yet ported to NPU.
         self._ensure_cp_prefill_row_kernel_metadata(forward_batch)
-        self._ensure_cp_prefill_batch_kernel_metadata(forward_batch)
 
         # Step-3 NPU compress metadata: only built when forward_npu paths are
         # active (env-gated). Each field is a per-request tensor consumed by
@@ -719,55 +727,70 @@ class DeepseekV4AscendAttnBackend(
             actual_q_pa.device,
         )
         # For round-robin CP each local position is unique, so seqused_kv
-        # (= local_pos + 1) is a bijection to the row index.  Key metadata by
-        # seqused_kv; pass global_q_pos = local_pos so the baked
-        # cu_seqlens_q = [local_pos, local_pos+1] encodes the absolute
-        # position — without this the SWA/causal mask always places Q at
-        # position 0, restricting every row to attend only to KV[0].
+        # (= local_pos + 1) is a bijection to the row index.  Key the
+        # per-row cache by seqused_kv so the forward loop can look up the
+        # right metadata with a single dict.get() per row.
+        #
+        # global_q_pos is passed to _compute_single_query_kernel_metadata
+        # for documentation only — the function intentionally ignores it
+        # (see `_ = global_q_pos` there).  The kernel infers the Q token's
+        # global position purely from seqused_kv: with cu_seqlens_q=[0,1]
+        # and seqused_kv=G+1, the kernel places the single Q at position G
+        # and applies the SWA window [G-W+1, G] correctly.
+        import time as _time
+
         local_positions_list = local_positions.detach().cpu().tolist()
         unique_seqused_kv = []
+        t0 = _time.monotonic()
         for local_pos in local_positions_list:
             local_pos = int(local_pos)
             seq_len = local_pos + 1  # seqused_kv for this row
             if seq_len in self.dsv4_cp_prefill_row_kernel_metadata:
                 continue  # already pre-warmed (duplicate global position)
             unique_seqused_kv.append(seq_len)
-            self.dsv4_cp_prefill_row_kernel_metadata[seq_len] = (
-                self._clone_kernel_metadata(
-                    self._compute_single_query_kernel_metadata(
-                        forward_batch,
-                        seqused_kv=seq_len,
-                        global_q_pos=local_pos,
-                    )
+            row_meta = self._clone_kernel_metadata(
+                self._compute_single_query_kernel_metadata(
+                    forward_batch,
+                    seqused_kv=seq_len,
+                    global_q_pos=local_pos,
                 )
             )
-        if get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False"):
+            # li_quant_metadata is built by _compute_kernel_metadata for the
+            # lightning-indexer fused path (_forward_npu_fused), which is
+            # explicitly disabled in CP mode (indexer.py: "not use_prefill_cp").
+            # Storing it per-row would keep O(n_local) large tensors alive and
+            # waste ~n_local npu_quant_lightning_indexer_metadata AICPU calls
+            # (16K calls for 128K / cp_size=8) that produce output that is
+            # never read.  Drop it unconditionally from the per-row cache.
+            row_meta.pop("li_quant_metadata", None)
+            self.dsv4_cp_prefill_row_kernel_metadata[seq_len] = row_meta
+        elapsed_ms = (_time.monotonic() - t0) * 1000.0
+        # Log pre-warm timing:
+        #   - always if CP_VERIFY is set (diagnostic mode)
+        #   - always on the first call (instance flag) so operators see the
+        #     one-time cost in the server log
+        #   - on any subsequent call that takes > 1 s (unexpected regression)
+        # For 128K / cp_size=8 this loop issues ~48K AICPU calls
+        # (c1a + c4a + c128a per unique seqused_kv, li_quant dropped).
+        # If elapsed_ms is unacceptably large, set
+        # SGLANG_DSV4_NPU_DISABLE_PREFILL_ROW_METADATA=True to fall back
+        # to the bulk (fm.kernel_metadata) metadata for all rows.
+        _cp_verify = get_bool_env_var("SGLANG_DSV4_NPU_CP_VERIFY", "False")
+        _first_prewarm = not getattr(self, "_dsv4_cp_prewarm_logged", False)
+        if _cp_verify or _first_prewarm or elapsed_ms > 1000.0:
+            self._dsv4_cp_prewarm_logged = True
             logger.warning(
-                "DSV4 NPU warmed CP prefill row metadata: q_rows=%s, "
-                "unique_rows=%s, min_seqused=%s, max_seqused=%s, positions=%s",
+                "DSV4 NPU CP prefill row metadata pre-warm: q_rows=%s "
+                "unique_rows=%s min_seqused=%s max_seqused=%s elapsed_ms=%.1f%s",
                 q_rows,
                 len(unique_seqused_kv),
-                min(unique_seqused_kv) if len(unique_seqused_kv) > 0 else None,
-                max(unique_seqused_kv) if len(unique_seqused_kv) > 0 else None,
-                local_positions_list,
+                min(unique_seqused_kv) if unique_seqused_kv else None,
+                max(unique_seqused_kv) if unique_seqused_kv else None,
+                elapsed_ms,
+                " [SLOW — consider DISABLE_PREFILL_ROW_METADATA=True]"
+                if elapsed_ms > 1000.0
+                else "",
             )
-
-    def _ensure_cp_prefill_batch_kernel_metadata(
-        self,
-        forward_batch: "ForwardBatch",
-    ) -> None:
-        """Retained as a no-op placeholder.
-
-        The batched virtual-request approach (one npu_sparse_attn_sharedkv call
-        with batch_size=n_local and per-element seqused_kv) caused aicore DDR
-        errors (errcode 507015) when multiple virtual requests share the same
-        physical KV page — the NPU kernel does not support shared-page batched
-        calls.  The forward methods now use the per-row loop backed by
-        _ensure_cp_prefill_row_kernel_metadata instead.  This stub preserves
-        the attribute so callers that reference dsv4_cp_prefill_batch_kernel_metadata
-        don't raise AttributeError.
-        """
-        self.dsv4_cp_prefill_batch_kernel_metadata = {}
 
     def _build_npu_compress_metadata(self, forward_batch: "ForwardBatch") -> None:
         """Populate c{4,128}_{page_table,state_page_table,state_loc,loc} on
@@ -1088,16 +1111,35 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: "ForwardBatch",
         num_tokens: int,
     ) -> Optional[list[int]]:
-        local_q_lens_cpu, _ = nsa_cp_round_robin_split_q_seqs_cpu(
-            forward_batch.extend_seq_lens_cpu,
-            keep_zeros=True,
+        """Map each local Q row to its owning request index within the batch.
+
+        MULTI-BATCH IS NOT YET SUPPORTED under round-robin CP prefill. The
+        scheduler currently pins CP prefill to batch=1 (schedule_policy.py:
+        "the prefill-batch setting is temporarily set to 1"; cp_utils.can_cp_
+        split requires seq_lens_cpu.shape[0] == 1). This helper is the single
+        place that would compute per-row request ownership once multi-batch is
+        enabled, so the per-row / compressed forward paths already thread a
+        ``row_batch_indices`` argument through (their ``batch_idx`` branches are
+        the reserved multi-batch interface). For now we return ``None`` so every
+        downstream consumer takes its ``batch_idx = 0`` single-request branch.
+
+        When you DO add multi-batch: drop the assert, return the computed
+        ``batch_indices`` (the loop below already builds them), and validate the
+        per-request page-table indexing in the forward paths.
+        """
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        num_reqs = (
+            len(extend_seq_lens_cpu) if extend_seq_lens_cpu is not None else 1
         )
-        batch_indices: list[int] = []
-        for batch_idx, q_len in enumerate(local_q_lens_cpu):
-            batch_indices.extend([batch_idx] * int(q_len))
-        if len(batch_indices) < num_tokens:
-            return None
-        return batch_indices[:num_tokens]
+        assert num_reqs <= 1, (
+            "DSV4 NPU round-robin CP prefill currently supports batch=1 only "
+            f"(got {num_reqs} requests). Multi-batch is intentionally deferred; "
+            "see _dsv4_cp_prefill_local_batch_indices for the reserved interface."
+        )
+        # Single-request fast path: every row belongs to request 0, so the
+        # downstream batch_idx=0 branches are correct and we can skip building
+        # an explicit index list.
+        return None
 
     def _forward_dense_cp_prefill_torch(
         self,
@@ -1282,6 +1324,11 @@ class DeepseekV4AscendAttnBackend(
                     attn_sink,
                     compress_ratio,
                 )
+            # Round-robin CP prefill: one npu_sparse_attn_sharedkv call per
+            # local Q row.  Strided round-robin positions give each row a
+            # distinct causal boundary, and the kernel cannot batch the rows
+            # over shared KV pages (507015 — see init_forward_metadata), so the
+            # per-row loop is the only correct shape here.
             _skip_row_meta = get_bool_env_var(
                 "SGLANG_DSV4_NPU_CP_SKIP_ROW_META", "False"
             )
@@ -1300,21 +1347,25 @@ class DeepseekV4AscendAttnBackend(
                     int(local_seqused_kv.max().item()),
                 )
             out = torch.empty_like(q)
+            # Hoist device->host syncs out of the loop: one transfer each for
+            # seqused_kv / positions instead of 2*n_local per-row .item() calls,
+            # and prebuild the constant cu_seqlens_q=[0,1] reused by every row.
+            local_seqused_kv_list = local_seqused_kv.detach().cpu().tolist()
+            local_positions_list = local_positions.detach().cpu().tolist()
+            row_cu_seqlens_q = torch.tensor(
+                [0, 1], dtype=_cu_q_dtype, device=q.device
+            )
             for row_idx in range(n_local):
-                row_seq_len = int(local_seqused_kv[row_idx].item())
-                row_global_q_pos = int(local_positions[row_idx].item())
+                row_seq_len = int(local_seqused_kv_list[row_idx])
+                row_global_q_pos = int(local_positions_list[row_idx])
                 batch_idx = (
                     row_batch_indices[row_idx]
                     if row_batch_indices is not None
                     else 0
                 )
-                # cu_seqlens_q indexes q[row_idx:row_idx+1]; use local offsets.
-                # The global causal/KV boundary is carried by row_seqused_kv.
-                row_cu_seqlens_q = torch.tensor(
-                    [0, 1],
-                    dtype=_cu_q_dtype,
-                    device=q.device,
-                )
+                # cu_seqlens_q indexes q[row_idx:row_idx+1] (local offsets); the
+                # global causal/KV boundary is carried by row_seqused_kv.
+                # row_cu_seqlens_q is hoisted above the loop (constant [0,1]).
                 row_seqused_kv = torch.tensor(
                     [row_seq_len],
                     dtype=fm.actual_seq_lengths_kv.dtype,
@@ -1554,10 +1605,8 @@ class DeepseekV4AscendAttnBackend(
                 forward_batch,
                 n_local,
             )
-            disable_prefill_cmp_kv = get_bool_env_var(
-                "SGLANG_DSV4_NPU_DISABLE_PA_PREFILL_CMP_KV",
-                "False",
-            )
+            # disable_prefill_cmp_kv is already read at function entry (above);
+            # reuse it here rather than re-reading the env var inside the CP branch.
             _torch_dense_prefill = get_bool_env_var(
                 "SGLANG_DSV4_NPU_TORCH_DENSE_PREFILL", "False"
             )
@@ -1606,6 +1655,29 @@ class DeepseekV4AscendAttnBackend(
                 layer.layer_id,
                 self._dsv4_num_hidden_layers,
             )
+            # Safety: compressed read requires the ratio-specific page table,
+            # built only when SGLANG_DSV4_NPU_REAL_COMPRESSOR=1.  If the flag
+            # pair is inconsistent (CP_ENABLE_C{N}_COMPRESSED=1 but
+            # REAL_COMPRESSOR=0), the getattr fallback above silently used
+            # fm.swa_page_table as cmp_block_table, which would feed wrong
+            # page indices to the compressed attention kernel.  Detect this
+            # and force C1 fallback with an explanatory log.
+            _c_page_table_attr = f"c{compress_ratio}_page_table"
+            if not hasattr(fm, _c_page_table_attr):
+                if _enable_c4_cmp or _enable_c128_cmp:
+                    logger.warning(
+                        "DSV4 CP: %s not found on forward_metadata "
+                        "(SGLANG_DSV4_NPU_REAL_COMPRESSOR not enabled?); "
+                        "overriding enable_c%d_cmp=False and forcing C1 fallback "
+                        "to avoid corrupted output from wrong cmp_block_table. "
+                        "layer=%s ratio=%s",
+                        _c_page_table_attr,
+                        compress_ratio,
+                        layer.layer_id,
+                        compress_ratio,
+                    )
+                _enable_c4_cmp = False
+                _enable_c128_cmp = False
             _c1_torch_fallback = disable_prefill_cmp_kv or get_bool_env_var(
                 "SGLANG_DSV4_NPU_CP_C1_TORCH_FALLBACK", "False"
             ) or (
@@ -1937,6 +2009,23 @@ class DeepseekV4AscendAttnBackend(
                         getattr(forward_batch, "extend_seq_lens_cpu", None),
                     )
                 swa_loc = swa_loc[:cache_rows]
+            elif cache_rows > loc_rows:
+                # swa_k is the all-gathered KV (total_len tokens in global
+                # sequential order after cp_all_gather_rerange_output).
+                # out_cache_loc (and thus swa_loc) is LOCAL to this rank
+                # (loc_rows = n_local = total_len // cp_size slots).
+                # Round-robin distributes global position p to rank p%cp_size,
+                # so rank r's tokens are at global rows r, r+cp_size, r+2*cp_size...
+                # Extract exactly those rows and trim to loc_rows so the pool
+                # receives the correct K for this rank, enabling decode to read
+                # back the right values.
+                from sglang.srt.layers.attention.nsa.utils import (
+                    get_nsa_prefill_cp_rank,
+                    get_nsa_prefill_cp_size,
+                )
+                cp_rank = get_nsa_prefill_cp_rank()
+                cp_size = get_nsa_prefill_cp_size()
+                swa_k = swa_k[cp_rank::cp_size][:loc_rows]
         if get_bool_env_var(
             "SGLANG_DSV4_NPU_CP_VERIFY", "False"
         ) and _dsv4_npu_should_log_layer(layer_id, self._dsv4_num_hidden_layers):
