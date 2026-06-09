@@ -99,18 +99,23 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
+        prefix_cpu = forward_batch.extend_prefix_lens_cpu
         ratio_lists: dict = {r: [] for r in self._dsv4_compress_ratios if r in (4, 128)}
         for idx in range(bs):
             start = int(cu_cpu[idx])
             end = int(cu_cpu[idx + 1])
             if end == start:
                 continue
-            seq = end - start
-            req_positions = positions[start:end]
+            prefix = int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+            total = prefix + (end - start)
             for ratio in ratio_lists:
-                cutoff = seq - (seq % ratio)
-                if cutoff > 0:
-                    ratio_lists[ratio].append(req_positions[:cutoff:ratio])
+                first_k = prefix // ratio
+                last_k = total // ratio
+                if last_k > first_k:
+                    ratio_lists[ratio].append(
+                        torch.arange(first_k, last_k, device=device, dtype=torch.int64)
+                        * ratio
+                    )
 
         for ratio in (4, 128):
             if ratio not in ratio_lists:
@@ -127,7 +132,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
 
         # start_pos=0: chunked prefill unsupported; seqused=None -> op derives lens from cu_seqlens
-        fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
+        if forward_batch.extend_prefix_lens is not None:
+            fm.start_pos = forward_batch.extend_prefix_lens.to(
+                device=device, dtype=torch.int32
+            )
+        else:
+            fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         fm.seqused = None
 
         # bundle out_c*_loc is densely packed in batch order (matches cmp_kv); invalid under chunked prefill
@@ -151,9 +161,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if spt is None:
                 continue
             for idx in range(bs):
-                seqlen = int(cu_cpu[idx + 1] - cu_cpu[idx])
-                if seqlen == 0:
+                chunk_len = int(cu_cpu[idx + 1] - cu_cpu[idx])
+                if chunk_len == 0:
                     continue
+                seqlen = (
+                    int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+                ) + chunk_len
                 tail = seqlen % 128
                 if ratio == 4:
                     c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
