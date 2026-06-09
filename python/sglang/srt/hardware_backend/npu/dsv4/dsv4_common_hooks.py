@@ -95,7 +95,12 @@ def maybe_write_dsv4_extend(
         _write_state_tail_per_req(
             req_to_token_pool.write_c4_state,
             req_pool_indices_cpu,
-            [getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs],
+            [
+                getattr(
+                    r, "c4_state_write_offset", getattr(r, "c4_state_alloc_offset", 0)
+                )
+                for r in batch.reqs
+            ],
             seq_lens_cpu,
             bundle.out_c4_state_loc,
         )
@@ -105,7 +110,14 @@ def maybe_write_dsv4_extend(
         _write_state_tail_per_req(
             req_to_token_pool.write_c128_state,
             req_pool_indices_cpu,
-            [getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs],
+            [
+                getattr(
+                    r,
+                    "c128_state_write_offset",
+                    getattr(r, "c128_state_alloc_offset", 0),
+                )
+                for r in batch.reqs
+            ],
             seq_lens_cpu,
             bundle.out_c128_state_loc,
         )
