@@ -371,6 +371,119 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
 
+    def _native_chunked_followup(
+        self,
+        compressor,
+        idx: int,
+        prefix_len: int,
+        chunk_len: int,
+        seqlen_offset: int,
+        kv_full: torch.Tensor,
+        score_full: torch.Tensor,
+        positions: torch.Tensor,
+        page_table: torch.Tensor,
+        forward_batch: ForwardBatch,
+        kv_out_list: list,
+        kv_out_positions: list,
+        kv_state_to_be_cached: list,
+        score_state_to_be_cached: list,
+        state_loc_list: list,
+        write_req_indices: list,
+        write_pos_in_req: list,
+        device: torch.device,
+    ) -> None:
+        """Native (unfused) compress for one chunked-prefill FOLLOW-UP chunk
+        (prefix_len > 0). Appends to the caller's accumulators in place so the
+        outer flush (set_state_buffer) + epilog stay unchanged.
+
+        Per the chunked_prefill_size % page_size == 0 constraint, chunk
+        boundaries are 128-aligned, so the global ratio-blocks this chunk
+        completes are ``[first_k, last_k)`` with ``first_k*ratio == prefix_len``
+        — i.e. they live entirely inside this chunk's tokens. The ONLY cross-chunk
+        dependency is c4's overlap: block ``first_k`` needs block ``first_k-1``
+        (= raw positions [prefix-ratio, prefix)), which the prior chunk stashed
+        into the state pool — read it via ``_get_kv_indices`` + ``get_state_buffer``
+        (NOT translate_kv_loc_to_compress_state_loc, which the NPU paged pool
+        rejects). State WRITE slots come from ``req_to_token_c{ratio}_state``
+        (populated by the allocator + maybe_write_dsv4_extend).
+
+        NOTE: UNVALIDATED on NPU — must be confirmed by chunked-vs-baseline
+        token parity (see benchmark/dsv4_chunked_parity.py).
+        """
+        ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        req_to_token_pool = forward_batch.req_to_token_pool
+        req_pool_idx = int(forward_batch.req_pool_indices[idx])
+        state_row = (
+            req_to_token_pool.req_to_token_c4_state
+            if ratio == 4
+            else req_to_token_pool.req_to_token_c128_state
+        )[req_pool_idx]
+
+        kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
+        score = score_full[seqlen_offset : seqlen_offset + chunk_len]
+        pos_req = positions[seqlen_offset : seqlen_offset + chunk_len]
+
+        total = prefix_len + chunk_len
+        first_k = prefix_len // ratio
+        last_k = total // ratio
+        cutoff = (last_k - first_k) * ratio  # local tokens that form whole blocks
+        remainder = chunk_len - cutoff
+        should_compress = last_k > first_k
+
+        # Stash this chunk's trailing partial-block tokens (consumed by a future
+        # chunk / decode). ape index = global_pos % ratio (position within the
+        # future block that will absorb them).
+        if remainder > 0:
+            gpos = torch.arange(cutoff, chunk_len, device=device) + prefix_len
+            kv_state_to_be_cached.append(kv[cutoff:chunk_len])
+            score_state_to_be_cached.append(
+                score[cutoff:chunk_len] + compressor.ape[gpos % ratio]
+            )
+            state_loc_list.append(state_row[gpos].to(torch.int64))
+        # Overlap: also stash the last complete block so the NEXT chunk's first
+        # block can overlap across the boundary.
+        if overlap and should_compress:
+            gpos = torch.arange(cutoff - ratio, cutoff, device=device) + prefix_len
+            kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
+            score_state_to_be_cached.append(
+                score[cutoff - ratio : cutoff] + compressor.ape
+            )
+            state_loc_list.append(state_row[gpos].to(torch.int64))
+
+        if not should_compress:
+            return
+
+        kvc = kv[:cutoff].unflatten(0, (-1, ratio))
+        scorec = score[:cutoff].unflatten(0, (-1, ratio)) + compressor.ape
+        if overlap:
+            kvc = _overlap_transform(kvc, value=0.0, head_dim=d)
+            scorec = _overlap_transform(scorec, value=float("-inf"), head_dim=d)
+            # Block first_k's previous block [prefix-ratio, prefix) is in the
+            # state pool (stashed by the prior chunk); inject it into block 0's
+            # overlap rows (the transform zero-filled them, valid only for a true
+            # first block).
+            kv_idx = _get_kv_indices(forward_batch, ratio, page_table, idx, prefix_len)
+            prior_kv, prior_score = token_to_kv_pool.get_state_buffer(
+                compressor.layer_id, compressor.is_in_indexer, kv_idx
+            )
+            prior_kv = prior_kv.squeeze(1)  # [ratio, coff*d]
+            prior_score = prior_score.squeeze(1)
+            kvc[0, :ratio] = prior_kv[:, :d]  # prev block's left half
+            scorec[0, :ratio] = prior_score[:, :d]  # already +ape at stash time
+        kv_compressed = (kvc * scorec.softmax(dim=1)).sum(dim=1)
+        n_out = kv_compressed.shape[0]
+        kv_out_list.append(kv_compressed)
+        # rope position per compressed block = block-start global position k*ratio
+        # (pos_req[0] == prefix == first_k*ratio).
+        kv_out_positions.append(pos_req[:cutoff:ratio])
+        write_req_indices.append(
+            torch.full((n_out,), idx, dtype=torch.int64, device=device)
+        )
+        write_pos_in_req.append(
+            torch.arange(first_k, last_k, dtype=torch.int64, device=device)
+        )
+
     def _forward_compress_native(
         self,
         compressor,
@@ -403,6 +516,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         is_prefill = forward_batch.forward_mode.is_prefill()
         token_to_kv_pool = self.token_to_kv_pool
         backend_fm = self.forward_metadata
@@ -433,6 +548,46 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if seqlen == 0:
                 continue
             if is_prefill:
+                chunk_len = (
+                    int(extend_seq_lens_cpu[idx])
+                    if extend_seq_lens_cpu is not None
+                    else seqlen
+                )
+                prefix_len = (
+                    int(extend_prefix_lens_cpu[idx])
+                    if extend_prefix_lens_cpu is not None
+                    else 0
+                )
+                if prefix_len > 0:
+                    # Chunked-prefill FOLLOW-UP chunk: the unfused path's
+                    # tail-only logic below assumes seqlen == this chunk's tokens
+                    # (true only for prefix==0). Handle follow-up chunks (which
+                    # complete global blocks spanning the prior chunk's stashed
+                    # state) in a dedicated helper, then skip the prefix==0 body.
+                    self._native_chunked_followup(
+                        compressor,
+                        idx,
+                        prefix_len,
+                        chunk_len,
+                        seqlen_offset,
+                        kv_full,
+                        score_full,
+                        positions,
+                        page_table,
+                        forward_batch,
+                        kv_out_list,
+                        kv_out_positions,
+                        kv_state_to_be_cached,
+                        score_state_to_be_cached,
+                        state_loc_list,
+                        write_req_indices,
+                        write_pos_in_req,
+                        device,
+                    )
+                    seqlen_offset += chunk_len
+                    continue
+                # prefix_len == 0 (non-chunked prefill OR first chunk):
+                # seqlen == chunk_len, so the original tail-only path is correct.
                 pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
 
                 # Per-req tail-only state alloc range; same formula as
