@@ -176,7 +176,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         The state pool is a separate paged slot space; each req allocates only
         its trailing window (cumulative lens precomputed by
-        ``ScheduleBatch._compute_dsv4_state_lens_*`` and passed via
+        ``compute_dsv4_state_lens_*`` and passed via
         ``DSV4StateLens``). ``state_last_loc`` is looked up from
         ``req_to_token_c{ratio}_state`` at the RAW position
         ``raw_prefix_lens - 1`` (the last position the previous extend/decode
@@ -282,7 +282,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Shared by alloc_extend / alloc_decode (which differ only in how
         prefix_lens is derived). State lens are tail-only, precomputed by
-        ScheduleBatch._compute_dsv4_state_lens_*; raw prefix_lens drives the
+        compute_dsv4_state_lens_*; raw prefix_lens drives the
         state last_loc lookup.
         """
         assert req_pool_indices is not None, (
@@ -291,7 +291,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         assert dsv4_state_lens is not None, (
             "DSV4NPUTokenToKVPoolAllocator requires dsv4_state_lens "
-            "(ScheduleBatch._compute_dsv4_state_lens_*)."
+            "(compute_dsv4_state_lens_*)."
         )
         out_c4_loc = self._alloc_c_extend(
             self.c4_attn_allocator,
@@ -346,8 +346,68 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out_c128_state_loc=out_c128_state_loc,
         )
 
+    def maybe_evict_dsv4_state(
+        self, req_to_token_pool, req: Req, pre_len: int, page_size: int
+    ) -> None:
+        """Free old compress-state pages before allocating new state slots."""
+        if (
+            self.c4_state_attn_allocator is None
+            and self.c128_state_attn_allocator is None
+        ):
+            return
+
+        c4_watermark = ((max(0, pre_len - (8 + 16))) // page_size) * page_size
+        c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
+
+        self._free_state_range(
+            self.c4_state_attn_allocator,
+            req_to_token_pool,
+            "req_to_token_c4_state",
+            req,
+            "c4_state_alloc_offset",
+            c4_watermark,
+        )
+        self._free_state_range(
+            self.c128_state_attn_allocator,
+            req_to_token_pool,
+            "req_to_token_c128_state",
+            req,
+            "c128_state_alloc_offset",
+            c128_watermark,
+        )
+
+    @staticmethod
+    def _free_state_range(
+        state_allocator,
+        req_to_token_pool,
+        table_attr: str,
+        req: Req,
+        offset_attr: str,
+        watermark: int,
+    ) -> None:
+        offset = getattr(req, offset_attr, 0)
+        if (
+            state_allocator is None
+            or req_to_token_pool is None
+            or not hasattr(req_to_token_pool, table_attr)
+            or req.req_pool_idx is None
+            or watermark <= offset
+        ):
+            return
+        free_slots = getattr(req_to_token_pool, table_attr)[
+            req.req_pool_idx, offset:watermark
+        ]
+        state_allocator.free(free_slots.to(torch.int64))
+        setattr(req, offset_attr, watermark)
+
     def compute_dsv4_state_lens_extend(
-        self, reqs: List[Req], seq_lens: List[int], prefix_lens: List[int]
+        self,
+        reqs: List[Req],
+        seq_lens: List[int],
+        prefix_lens: List[int],
+        *,
+        req_to_token_pool=None,
+        page_size: Optional[int] = None,
     ) -> Optional[DSV4StateLens]:
         """Per-req c{4,128}_state pool alloc lens for extend (tail-only).
 
@@ -367,7 +427,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
           * ``req.c{4,128}_state_kv_len`` — cumulative slot count (prefix for
             the paged allocator; never decreases on eviction).
           * ``req.c{4,128}_state_alloc_offset`` — low-water raw-position mark
-            for eviction (see ``dsv4_common_hooks.maybe_evict_dsv4_state``).
+            for eviction (see ``maybe_evict_dsv4_state``).
 
         Returns None when this model has no paged state pools (CUDA / non-V4 /
         zero budget) — callers pass that straight through as ``dsv4_state_lens``.
@@ -379,6 +439,12 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c128_prefix: List[int] = []
         c128_seq: List[int] = []
         for req, seq_len, prefix_len in zip(reqs, seq_lens, prefix_lens):
+            prefix_len = int(prefix_len)
+            if prefix_len > 0 and page_size is not None:
+                self.maybe_evict_dsv4_state(
+                    req_to_token_pool, req, prefix_len, page_size
+                )
+
             tail = seq_len % 128
             c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
             c128_alloc_len = tail
@@ -420,7 +486,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def compute_dsv4_state_lens_decode(
-        self, reqs: List[Req]
+        self,
+        reqs: List[Req],
+        *,
+        req_to_token_pool=None,
+        page_size: Optional[int] = None,
     ) -> Optional[DSV4StateLens]:
         """Per-req c{4,128}_state pool alloc lens for decode: exactly 1 new
         state slot per req per pool. ``c{N}_state_alloc_offset`` does NOT
@@ -433,6 +503,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c128_prefix: List[int] = []
         c128_seq: List[int] = []
         for req in reqs:
+            if page_size is not None:
+                self.maybe_evict_dsv4_state(
+                    req_to_token_pool, req, req.seqlen - 1, page_size
+                )
+
             prev_c4 = getattr(req, "c4_state_kv_len", 0)
             prev_c128 = getattr(req, "c128_state_kv_len", 0)
             c4_prefix.append(prev_c4)

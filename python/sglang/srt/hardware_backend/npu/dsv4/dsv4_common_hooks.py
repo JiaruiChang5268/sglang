@@ -283,32 +283,14 @@ def maybe_evict_dsv4_state(batch: ScheduleBatch, req: Req, pre_len: int) -> None
     setattr) is the low-water mark. No-op on non-DSV4-NPU paths.
     """
     allocator = batch.token_to_kv_pool_allocator
-    pool = batch.req_to_token_pool
-    if not hasattr(allocator, "c4_state_attn_allocator") or (
-        allocator.c4_state_attn_allocator is None
-        and allocator.c128_state_attn_allocator is None
-    ):
+    if not hasattr(allocator, "maybe_evict_dsv4_state"):
         return
 
-    page_size = batch.tree_cache.page_size
-    c4_watermark = ((max(0, pre_len - (8 + 16))) // page_size) * page_size
-    c128_watermark = ((max(0, pre_len - (128 + 64))) // page_size) * page_size
-
-    _free_state_range(
-        allocator.c4_state_attn_allocator,
-        pool,
-        "req_to_token_c4_state",
+    allocator.maybe_evict_dsv4_state(
+        batch.req_to_token_pool,
         req,
-        "c4_state_alloc_offset",
-        c4_watermark,
-    )
-    _free_state_range(
-        allocator.c128_state_attn_allocator,
-        pool,
-        "req_to_token_c128_state",
-        req,
-        "c128_state_alloc_offset",
-        c128_watermark,
+        pre_len,
+        batch.tree_cache.page_size,
     )
 
 
