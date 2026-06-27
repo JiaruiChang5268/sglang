@@ -64,7 +64,7 @@ def _overlap_transform(
 
 
 @dataclass
-class _NativeCompressAccumulator:
+class _NativeCompressOutputCollector:
     kv_out_list: list[torch.Tensor]
     kv_out_positions: list[torch.Tensor]
     kv_state_to_be_cached: list[torch.Tensor]
@@ -395,7 +395,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         positions: torch.Tensor,
         page_table: torch.Tensor,
         forward_batch: ForwardBatch,
-        acc: _NativeCompressAccumulator,
+        compress_output_collector: _NativeCompressOutputCollector,
         device: torch.device,
     ) -> None:
         ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
@@ -421,18 +421,24 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
 
         if remainder > 0:
             gpos = torch.arange(cutoff, chunk_len, device=device) + prefix_len
-            acc.kv_state_to_be_cached.append(kv[cutoff:chunk_len])
-            acc.score_state_to_be_cached.append(
+            compress_output_collector.kv_state_to_be_cached.append(kv[cutoff:chunk_len])
+            compress_output_collector.score_state_to_be_cached.append(
                 score[cutoff:chunk_len] + compressor.ape[gpos % ratio]
             )
-            acc.state_loc_list.append(state_row[gpos].to(torch.int64))
+            compress_output_collector.state_loc_list.append(
+                state_row[gpos].to(torch.int64)
+            )
         if overlap and should_compress:
             gpos = torch.arange(cutoff - ratio, cutoff, device=device) + prefix_len
-            acc.kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
-            acc.score_state_to_be_cached.append(
+            compress_output_collector.kv_state_to_be_cached.append(
+                kv[cutoff - ratio : cutoff]
+            )
+            compress_output_collector.score_state_to_be_cached.append(
                 score[cutoff - ratio : cutoff] + compressor.ape
             )
-            acc.state_loc_list.append(state_row[gpos].to(torch.int64))
+            compress_output_collector.state_loc_list.append(
+                state_row[gpos].to(torch.int64)
+            )
 
         if not should_compress:
             return
@@ -452,12 +458,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             scorec[0, :ratio] = prior_score[:, :d]
         kv_compressed = (kvc * scorec.softmax(dim=1)).sum(dim=1)
         n_out = kv_compressed.shape[0]
-        acc.kv_out_list.append(kv_compressed)
-        acc.kv_out_positions.append(pos_req[:cutoff:ratio])
-        acc.write_req_indices.append(
+        compress_output_collector.kv_out_list.append(kv_compressed)
+        compress_output_collector.kv_out_positions.append(pos_req[:cutoff:ratio])
+        compress_output_collector.write_req_indices.append(
             torch.full((n_out,), idx, dtype=torch.int64, device=device)
         )
-        acc.write_pos_in_req.append(
+        compress_output_collector.write_pos_in_req.append(
             torch.arange(first_k, last_k, dtype=torch.int64, device=device)
         )
 
@@ -503,7 +509,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         else:
             page_table = backend_fm.c128_state_page_table
 
-        acc = _NativeCompressAccumulator(
+        compress_output_collector = _NativeCompressOutputCollector(
             kv_out_list=[],
             kv_out_positions=[],
             kv_state_to_be_cached=[],
@@ -550,7 +556,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         positions,
                         page_table,
                         forward_batch,
-                        acc,
+                        compress_output_collector,
                         device,
                     )
                     seqlen_offset += chunk_len
@@ -620,21 +626,25 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     # Stash the trailing ratio tokens of the cutoff so the next
                     # decode step can do overlap compression across the boundary
                     # (for ratio=4 this window is inside the state alloc range).
-                    acc.kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
-                    acc.score_state_to_be_cached.append(
+                    compress_output_collector.kv_state_to_be_cached.append(
+                        kv[cutoff - ratio : cutoff]
+                    )
+                    compress_output_collector.score_state_to_be_cached.append(
                         score[cutoff - ratio : cutoff] + compressor.ape
                     )
-                    acc.state_loc_list.append(
+                    compress_output_collector.state_loc_list.append(
                         out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
                     )
                 if remainder > 0:
                     kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
                     score_cut, score_rem = score.split([cutoff, remainder], dim=0)
-                    acc.kv_state_to_be_cached.append(kv_rem)
-                    acc.score_state_to_be_cached.append(
+                    compress_output_collector.kv_state_to_be_cached.append(kv_rem)
+                    compress_output_collector.score_state_to_be_cached.append(
                         score_rem + compressor.ape[:remainder]
                     )
-                    acc.state_loc_list.append(out_cache_loc[-remainder:])
+                    compress_output_collector.state_loc_list.append(
+                        out_cache_loc[-remainder:]
+                    )
                     kv = kv_cut
                     score = score_cut
 
@@ -650,9 +660,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         dim=1
                     )  # [n_chunks, d]
                     n_compressed_this_req = kv_compressed.shape[0]
-                    acc.kv_out_list.append(kv_compressed)
-                    acc.kv_out_positions.append(pos_compressed)
-                    acc.write_req_indices.append(
+                    compress_output_collector.kv_out_list.append(kv_compressed)
+                    compress_output_collector.kv_out_positions.append(pos_compressed)
+                    compress_output_collector.write_req_indices.append(
                         torch.full(
                             (n_compressed_this_req,),
                             idx,
@@ -660,7 +670,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                             device=device,
                         )
                     )
-                    acc.write_pos_in_req.append(
+                    compress_output_collector.write_pos_in_req.append(
                         torch.arange(
                             n_compressed_this_req,
                             dtype=torch.int64,
@@ -719,24 +729,26 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         kv_compressed = (
                             kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
                         ).sum(dim=0, keepdim=True)
-                    acc.kv_out_list.append(kv_compressed)
-                    acc.kv_out_positions.append(pos_req)
+                    compress_output_collector.kv_out_list.append(kv_compressed)
+                    compress_output_collector.kv_out_positions.append(pos_req)
                     # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
                     decode_pos = seqlen // ratio - 1
-                    acc.write_req_indices.append(
+                    compress_output_collector.write_req_indices.append(
                         torch.tensor([idx], dtype=torch.int64, device=device)
                     )
-                    acc.write_pos_in_req.append(
+                    compress_output_collector.write_pos_in_req.append(
                         torch.tensor([decode_pos], dtype=torch.int64, device=device)
                     )
 
         # Flush the prefill state stash to the pool in one shot.
-        if acc.kv_state_to_be_cached:
-            kv_state_cat = torch.cat(acc.kv_state_to_be_cached, dim=0).unsqueeze(1)
-            score_state_cat = torch.cat(acc.score_state_to_be_cached, dim=0).unsqueeze(
-                1
-            )
-            state_loc_cat = torch.cat(acc.state_loc_list, dim=0)
+        if compress_output_collector.kv_state_to_be_cached:
+            kv_state_cat = torch.cat(
+                compress_output_collector.kv_state_to_be_cached, dim=0
+            ).unsqueeze(1)
+            score_state_cat = torch.cat(
+                compress_output_collector.score_state_to_be_cached, dim=0
+            ).unsqueeze(1)
+            state_loc_cat = torch.cat(compress_output_collector.state_loc_list, dim=0)
             token_to_kv_pool.set_state_buffer(
                 compressor.layer_id,
                 state_loc_cat,
@@ -747,9 +759,9 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
 
         # Norm + rope + optional hadamard on the freshly compressed tokens,
         # then write via _compressor_epilog_npu with explicit slab-derived locs.
-        if acc.kv_out_list:
-            kv_out = torch.cat(acc.kv_out_list, dim=0).to(dtype)
-            pos_out = torch.cat(acc.kv_out_positions, dim=0)
+        if compress_output_collector.kv_out_list:
+            kv_out = torch.cat(compress_output_collector.kv_out_list, dim=0).to(dtype)
+            pos_out = torch.cat(compress_output_collector.kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
             # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
             # to (T, 1, 1, rope_dim); cos=real, sin=imag of the complex freqs_cis.
@@ -785,8 +797,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
             # token-level slot id table is indexed directly by compressed-seq
             # position (elements already are c-pool slot ids; no page indirection).
-            req_indices_flat = torch.cat(acc.write_req_indices, dim=0)
-            pos_in_req_flat = torch.cat(acc.write_pos_in_req, dim=0)
+            req_indices_flat = torch.cat(
+                compress_output_collector.write_req_indices, dim=0
+            )
+            pos_in_req_flat = torch.cat(
+                compress_output_collector.write_pos_in_req, dim=0
+            )
             req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
             c_table = (
                 self.req_to_token_pool.req_to_token_c4
