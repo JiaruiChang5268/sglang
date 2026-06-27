@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4St
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -346,7 +347,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def compute_dsv4_state_lens_extend(
-        self, reqs: List[Req], seq_lens: List[int]
+        self, reqs: List[Req], seq_lens: List[int], prefix_lens: List[int]
     ) -> Optional[DSV4StateLens]:
         """Per-req c{4,128}_state pool alloc lens for extend (tail-only).
 
@@ -377,15 +378,25 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c4_seq: List[int] = []
         c128_prefix: List[int] = []
         c128_seq: List[int] = []
-        for req, seq_len in zip(reqs, seq_lens):
+        for req, seq_len, prefix_len in zip(reqs, seq_lens, prefix_lens):
             tail = seq_len % 128
             c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
             c128_alloc_len = tail
+            chunk_len = seq_len - prefix_len
+
+            if prefix_len > 0:
+                c4_count = min(c4_alloc_len, chunk_len)
+                c128_count = min(c128_alloc_len, chunk_len)
+            else:
+                c4_count = c4_alloc_len
+                c128_count = c128_alloc_len
+                req.c4_state_alloc_offset = seq_len - c4_alloc_len
+                req.c128_state_alloc_offset = seq_len - c128_alloc_len
 
             prev_c4 = getattr(req, "c4_state_kv_len", 0)
             prev_c128 = getattr(req, "c128_state_kv_len", 0)
-            new_c4 = prev_c4 + c4_alloc_len
-            new_c128 = prev_c128 + c128_alloc_len
+            new_c4 = prev_c4 + c4_count
+            new_c128 = prev_c128 + c128_count
 
             c4_prefix.append(prev_c4)
             c4_seq.append(new_c4)
@@ -394,8 +405,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
             req.c4_state_kv_len = new_c4
             req.c128_state_kv_len = new_c128
-            req.c4_state_alloc_offset = seq_len - c4_alloc_len
-            req.c128_state_alloc_offset = seq_len - c128_alloc_len
+            req.c4_state_write_offset = seq_len - c4_count
+            req.c128_state_write_offset = seq_len - c128_count
 
         return self._pack_state_lens(
             c4_prefix,
