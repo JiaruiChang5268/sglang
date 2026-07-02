@@ -82,7 +82,14 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"got {server_args.cp_strategy}"
         )
 
+    # DeepSeek V4 always drives CP through the DSA (NSA-family) runtime path,
+    # never the MLA one. The first _handle_legacy_cp_arguments() pass runs before
+    # this model hook resolves attention_backend to "dsv4", so the canonical
+    # --enable-prefill-cp may have been mirrored onto enable_prefill_context_parallel
+    # (the MLA alias). Clear it here so the two legacy aliases are not both set --
+    # _handle_context_parallelism() rejects that as mutually exclusive.
     server_args.enable_dsa_prefill_context_parallel = True
+    server_args.enable_prefill_context_parallel = False
     server_args.dsa_prefill_cp_mode = (
         "round-robin-split"
         if server_args.cp_strategy == "interleave"
