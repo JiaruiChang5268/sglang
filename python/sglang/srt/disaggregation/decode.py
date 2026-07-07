@@ -948,6 +948,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if total_prefix_len != 0 and hasattr(
+                self.token_to_kv_pool_allocator, "c4_attn_allocator"
+            ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                raise RuntimeError(
+                    "DSV4 NPU PD disaggregation does not support decode-side "
+                    "prefix cache yet; disable disaggregation decode radix/HiCache "
+                    "for PD + chunked prefill."
+                )
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1053,6 +1064,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if hasattr(self.req_to_token_pool, "req_to_token_c4"):
                 # DSV4 on NPU: per-pool dst page indices, produced by the same
                 # shared builder prefill uses so src/dst line up positionally.
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     build_dsv4_kv_transfer_payloads,
                 )
@@ -1064,6 +1081,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.token_to_kv_pool_allocator.page_size,
                     self.scheduler.sliding_window_size,
                     state_types,
+                    prefix_len=total_prefix_len,
                 )
             else:
                 state_indices: Optional[List] = []
@@ -1410,12 +1428,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             dsv4_kwargs = {}
             if dsv4_alloc is not None:
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
                 dsv4_kwargs = dict(
                     req_pool_indices=torch.tensor(
                         [req.req_pool_idx], dtype=torch.int64, device=device
                     ),
                     dsv4_state_lens=dsv4_alloc.compute_dsv4_state_lens_extend(
-                        [req], [fill_len]
+                        [req], [fill_len], [0]
                     ),
                     req_to_token_pool=self.req_to_token_pool,
                 )

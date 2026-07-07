@@ -38,6 +38,12 @@ class AscendKVManager(MooncakeKVManager):
             or st in _DSV4_KVCACHE_STATE_TYPES
         )
 
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        return (
+            super()._requires_exact_state_index_match(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()

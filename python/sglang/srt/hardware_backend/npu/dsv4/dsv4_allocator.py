@@ -733,8 +733,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             n = kv_len // ratio
             if n > 0 and hasattr(req_to_token_pool, table_attr):
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, :n]
+                slots = slots[slots > 0]
                 # to int64 — paged allocator's free does cpu()//page_size on it.
-                allocator.free(slots.to(torch.int64))
+                if slots.numel() > 0:
+                    allocator.free(slots.to(torch.int64))
 
         # State pools: free only the tail [c{N}_state_alloc_offset, kv_len).
         for ratio, allocator, table_attr, off_attr in (
@@ -756,7 +758,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             off = getattr(req, off_attr, 0)
             if kv_len > off:
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, off:kv_len]
-                allocator.free(slots.to(torch.int64))
+                slots = slots[slots > 0]
+                if slots.numel() > 0:
+                    allocator.free(slots.to(torch.int64))
 
     def backup_state(self):
         # EAGLE/NEXTN draft preprocess allocates speculative c{4,128} KV via

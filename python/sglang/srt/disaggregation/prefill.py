@@ -1076,6 +1076,7 @@ class SchedulerDisaggregationPrefillMixin:
                     page_size,
                     self.sliding_window_size,
                     state_types,
+                    prefix_len=0,
                 )
             else:
                 state_indices = []

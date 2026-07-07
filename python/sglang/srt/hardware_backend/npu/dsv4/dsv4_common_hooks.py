@@ -134,46 +134,109 @@ def build_dsv4_kv_transfer_payloads(
     page_size: int,
     window_size: int,
     state_types,
+    *,
+    prefix_len: int = 0,
 ):
-    """Per-pool PD-transfer page indices aligned to ``state_types``; prefill (src)
-    and decode (dst) must produce identical lists or KV is silently corrupted."""
+    """Per-pool PD-transfer page indices aligned to ``state_types``.
+
+    For chunked prefill, intermediate chunks can leave old C4/C128 state pages in
+    the req table. PD only needs the final active tail state; scanning the whole
+    prompt span would transfer stale state pages and can perturb decode accuracy.
+    """
     import numpy as np
 
     from sglang.srt.disaggregation.base.conn import StateType
-    from sglang.srt.mem_cache.common import kv_to_page_indices
 
-    def pages(table, lo: int, hi: int):
+    seq_len = max(0, int(seq_len))
+    prefix_len = max(0, min(int(prefix_len), seq_len))
+
+    def empty_pages():
+        return np.empty((0,), dtype=np.int32)
+
+    def pages(table, lo: int, hi: int, *, drop_zero_pages: bool = False):
         if hi <= lo:
-            return np.empty((0,), dtype=np.int32)
-        slots = table[req_pool_idx, lo:hi].cpu().numpy()
-        return kv_to_page_indices(slots, page_size).astype(np.int32)
+            return empty_pages()
 
-    def state_pages(table):
-        # Whole prompt span, mirroring the kernel state_block_table
-        # (state_table[req, ::page_size]//page_size); non-tail = skip sentinel page 0.
-        n_pages = (seq_len + page_size - 1) // page_size
-        return pages(table, 0, n_pages * page_size)
+        lo = max(0, int(lo))
+        hi = max(lo, int(hi))
+        page_lo = (lo // page_size) * page_size
+        page_hi = ((hi + page_size - 1) // page_size) * page_size
+        if page_hi <= page_lo:
+            return empty_pages()
 
-    window_start = max(0, seq_len - window_size)
+        slots = table[req_pool_idx, page_lo:page_hi:page_size].cpu().numpy()
+        if slots.size == 0:
+            return empty_pages()
+
+        page_indices = (slots // page_size).astype(np.int32)
+        if drop_zero_pages:
+            page_indices = page_indices[page_indices > 0]
+        return page_indices
+
+    def state_tail_range(compress_ratio: int):
+        tail_len = seq_len % 128
+        if compress_ratio == 4:
+            state_len = tail_len + 128 if tail_len <= 3 and seq_len >= 128 else tail_len
+        elif compress_ratio == 128:
+            state_len = tail_len
+        else:
+            raise ValueError(f"Unsupported DSV4 state compress ratio: {compress_ratio}")
+
+        if state_len == 0:
+            return None
+
+        start = max(prefix_len, seq_len - state_len)
+        if start >= seq_len:
+            return None
+        return start, seq_len
+
+    def state_pages(table, compress_ratio: int):
+        state_range = state_tail_range(compress_ratio)
+        if state_range is None:
+            return empty_pages()
+        lo, hi = state_range
+        return pages(table, lo, hi, drop_zero_pages=True)
+
+    if window_size is None or window_size <= 0:
+        window_start = prefix_len
+    else:
+        window_start = max(prefix_len, seq_len - window_size)
     window_start = (window_start // page_size) * page_size
 
     out = []
     for st in state_types:
         if st == StateType.DSV4_SWA:
-            out.append(pages(req_to_token_pool.req_to_token_swa, window_start, seq_len))
+            out.append(
+                pages(
+                    req_to_token_pool.req_to_token_swa,
+                    window_start,
+                    seq_len,
+                    drop_zero_pages=True,
+                )
+            )
         elif st == StateType.DSV4_C4:
-            out.append(pages(req_to_token_pool.req_to_token_c4, 0, seq_len // 4))
+            out.append(
+                pages(req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4)
+            )
         elif st == StateType.DSV4_C128:
-            out.append(pages(req_to_token_pool.req_to_token_c128, 0, seq_len // 128))
+            out.append(
+                pages(
+                    req_to_token_pool.req_to_token_c128,
+                    prefix_len // 128,
+                    seq_len // 128,
+                )
+            )
         elif st == StateType.DSV4_INDEXER:
             # indexer shares the c4 slot space (written at the c4 loc).
-            out.append(pages(req_to_token_pool.req_to_token_c4, 0, seq_len // 4))
+            out.append(
+                pages(req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4)
+            )
         elif st == StateType.DSV4_C4_STATE:
-            out.append(state_pages(req_to_token_pool.req_to_token_c4_state))
+            out.append(state_pages(req_to_token_pool.req_to_token_c4_state, 4))
         elif st == StateType.DSV4_C128_STATE:
-            out.append(state_pages(req_to_token_pool.req_to_token_c128_state))
+            out.append(state_pages(req_to_token_pool.req_to_token_c128_state, 128))
         else:
-            out.append(np.empty((0,), dtype=np.int32))
+            out.append(empty_pages())
     return out
 
 
@@ -501,5 +564,7 @@ def _free_state_range(
     if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
         return
     free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
-    state_allocator.free(free_slots.to(torch.int64))
+    free_slots = free_slots[free_slots > 0]
+    if free_slots.numel() > 0:
+        state_allocator.free(free_slots.to(torch.int64))
     setattr(req, offset_attr, watermark)

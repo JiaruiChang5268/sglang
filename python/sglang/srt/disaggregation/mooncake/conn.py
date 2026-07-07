@@ -928,6 +928,10 @@ class MooncakeKVManager(CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (StateType.SWA, StateType.DSA, StateType.SWA_RING)
 
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        """State types whose page lists are positional and must not be truncated."""
+        return st == StateType.SWA_RING
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1019,12 +1023,11 @@ class MooncakeKVManager(CommonKVManager):
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if len(src_indices) != len(dst_indices_local):
-                    # SWA_RING is positional: truncating silently misaligns rows
-                    # and corrupts KV, so fail loud. Paged SWA/DSA tolerate a
-                    # 1-page drift -> keep the lenient truncation below.
-                    if st == StateType.SWA_RING:
+                    # Positional state lists must match exactly; truncating them
+                    # silently misaligns rows/pages and corrupts KV.
+                    if self._requires_exact_state_index_match(st):
                         raise RuntimeError(
-                            "SWA_RING state index length mismatch: "
+                            f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                         )
                     logger.warning(
