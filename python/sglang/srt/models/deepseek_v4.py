@@ -1918,7 +1918,9 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
-    def _prepare_npu_rope_position_caches(self, positions: torch.Tensor) -> None:
+    def _prepare_npu_rope_position_caches(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> None:
         if not _is_npu:
             return
         seen_rotary_embs: Set[int] = set()
@@ -1939,7 +1941,7 @@ class DeepseekV4Model(nn.Module):
                 rotary_emb,
                 self_attn.freqs_cis,
                 positions,
-                torch.float32,
+                dtype,
                 view_4d=True,
                 allow_build=False,
                 cache_dtype=torch.float32,
@@ -2021,7 +2023,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        self._prepare_npu_rope_position_caches(positions)
+        self._prepare_npu_rope_position_caches(positions, hidden_states.dtype)
 
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
