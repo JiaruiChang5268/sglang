@@ -49,7 +49,9 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
+    ensure_npu_interleaved_rope_cache,
+    get_npu_interleaved_rope_cos_sin,
+    npu_partial_rotary_mul_inplace,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -369,6 +371,9 @@ class MQALayer(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+        if _is_npu:
+            ensure_npu_interleaved_rope_cache(self.rotary_emb, freqs_cis, torch.float32)
+
         if _is_hip:
             cos_cache = freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
             sin_cache = freqs_cis.imag.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
@@ -494,6 +499,40 @@ class MQALayer(nn.Module):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+    def _get_npu_rope_position_cache(
+        self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sin_attr = (
+            "inverse_position_sin_layer_cache"
+            if inverse
+            else "position_sin_layer_cache"
+        )
+        cos4 = getattr(self.rotary_emb, "position_cos_layer_cache", None)
+        sin4 = getattr(self.rotary_emb, sin_attr, None)
+        if (
+            cos4 is None
+            or sin4 is None
+            or cos4.shape[0] != positions.shape[0]
+            or sin4.shape[0] != positions.shape[0]
+            or cos4.dtype != dtype
+            or sin4.dtype != dtype
+            or cos4.device != positions.device
+            or sin4.device != positions.device
+        ):
+            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+                self.rotary_emb,
+                self.freqs_cis,
+                positions,
+                dtype,
+                view_4d=True,
+                inverse=inverse,
+                allow_build=False,
+                cache_dtype=torch.float32,
+            )
+            self.rotary_emb.position_cos_layer_cache = cos4
+            setattr(self.rotary_emb, sin_attr, sin4)
+        return cos4, sin4
 
     def _compute_q_a(
         self,
@@ -859,11 +898,14 @@ class MQALayer(nn.Module):
                 kv, _ = self.wkv(x)
             kv = self.kv_norm(kv)
 
-            v4_rope_inplace_npu(
+            cos4, sin4 = self._get_npu_rope_position_cache(
+                positions, q.dtype, inverse=False
+            )
+            npu_partial_rotary_mul_inplace(
                 q,
                 kv.unsqueeze(1),
-                self.freqs_cis,
-                positions,
+                cos4,
+                sin4,
                 qk_nope=self.qk_nope_head_dim,
             )
             attn_backend.store_cache(
@@ -1068,13 +1110,15 @@ class MQALayer(nn.Module):
                 )
             o = o[:, tp_slice, :]
         if _is_npu:
-            v4_rope_inplace_npu(
+            cos4, sin4 = self._get_npu_rope_position_cache(
+                positions, o.dtype, inverse=True
+            )
+            npu_partial_rotary_mul_inplace(
                 o,
                 None,
-                self.freqs_cis,
-                positions,
+                cos4,
+                sin4,
                 qk_nope=self.qk_nope_head_dim,
-                inverse=True,
             )
         else:
             fused_rope_inplace(
@@ -1929,6 +1973,38 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
+    def _prepare_npu_rope_position_caches(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> None:
+        if not _is_npu:
+            return
+        seen_rotary_embs: Set[int] = set()
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:
+                continue
+            rotary_emb = getattr(self_attn, "rotary_emb", None)
+            if rotary_emb is None:
+                continue
+            rotary_key = id(rotary_emb)
+            if rotary_key in seen_rotary_embs:
+                continue
+            seen_rotary_embs.add(rotary_key)
+
+            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+                rotary_emb,
+                self_attn.freqs_cis,
+                positions,
+                dtype,
+                view_4d=True,
+                allow_build=False,
+                cache_dtype=torch.float32,
+            )
+            rotary_emb.position_cos_layer_cache = cos4
+            rotary_emb.position_sin_layer_cache = sin4
+            rotary_emb.inverse_position_sin_layer_cache = -sin4
+
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
 
@@ -2083,7 +2159,7 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-
+        self._prepare_npu_rope_position_caches(positions, hidden_states.dtype)
         if self._can_run_tbo(forward_batch):
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
