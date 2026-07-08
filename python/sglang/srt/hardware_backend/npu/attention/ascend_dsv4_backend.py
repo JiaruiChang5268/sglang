@@ -958,6 +958,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
+        qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
         cos4 = getattr(c4_indexer.rotary_emb, "position_cos_layer_cache", None)
         sin4 = getattr(c4_indexer.rotary_emb, "position_sin_layer_cache", None)
         if (
@@ -984,7 +985,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
             None,
             cos4,
             sin4,
-            qk_nope=c4_indexer.head_dim - c4_indexer.rope_head_dim,
+            qk_nope=qk_nope,
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 
