@@ -731,6 +731,7 @@ def v4_rope_inplace_npu(
     kv_rope: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    qk_nope: int = 0,
     inverse: bool = False,
 ) -> None:
     """In-place interleaved RoPE for V4 — torch fallback used on NPU.
@@ -774,7 +775,7 @@ def v4_rope_inplace_npu(
         cos4,
         sin4,
         rotary_mode="interleave",
-        partial_slice=[0, rope_dim],
+        partial_slice=[qk_nope, qk_nope + rope_dim],
     )
     if kv_rope is not None:
         if kv_rope.dim() == 3:
@@ -786,5 +787,5 @@ def v4_rope_inplace_npu(
             cos4,
             sin4,
             rotary_mode="interleave",
-            partial_slice=[0, rope_dim],
+            partial_slice=[qk_nope, qk_nope + rope_dim],
         )

@@ -860,10 +860,11 @@ class MQALayer(nn.Module):
             kv = self.kv_norm(kv)
 
             v4_rope_inplace_npu(
-                q[..., -self.qk_rope_head_dim :],
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                q,
+                kv.unsqueeze(1),
                 self.freqs_cis,
                 positions,
+                qk_nope=self.qk_nope_head_dim,
             )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
@@ -1068,10 +1069,11 @@ class MQALayer(nn.Module):
             o = o[:, tp_slice, :]
         if _is_npu:
             v4_rope_inplace_npu(
-                o[..., -self.qk_rope_head_dim :],
+                o,
                 None,
                 self.freqs_cis,
                 positions,
+                qk_nope=self.qk_nope_head_dim,
                 inverse=True,
             )
         else:

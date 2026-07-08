@@ -949,10 +949,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
         v4_rope_inplace_npu(
-            q[..., -c4_indexer.rope_head_dim :],
-            None,
-            c4_indexer.freqs_cis,
-            positions,
+            q, None, c4_indexer.freqs_cis, positions, qk_nope=self.qk_nope_head_dim
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 
