@@ -1129,6 +1129,7 @@ class MQALayer(nn.Module):
                 None,
                 self.freqs_cis,
                 positions,
+                qk_nope=self.qk_nope_head_dim,
                 inverse=True,
             )
         else:

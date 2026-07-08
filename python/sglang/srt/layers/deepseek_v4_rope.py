@@ -787,5 +787,5 @@ def v4_rope_inplace_npu(
             cos4,
             sin4,
             rotary_mode="interleave",
-            partial_slice=[0, rope_dim],
+            partial_slice=[qk_nope, qk_nope + rope_dim],
         )
