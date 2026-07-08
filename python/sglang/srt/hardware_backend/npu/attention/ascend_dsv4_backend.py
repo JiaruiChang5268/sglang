@@ -396,7 +396,11 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
 
         cos, sin = get_fused_compressor_rope_cos_sin(
-            compressor.freqs_cis, positions_cmp, dtype=torch.float32
+            compressor.freqs_cis,
+            positions_cmp,
+            dtype=torch.float32,
+            cache_owner=getattr(compressor, "rotary_emb", None),
+            allow_build=False,
         )
 
         cmp_kv = torch.ops.custom.compressor(
@@ -710,28 +714,19 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
-            # npu_rotary_mul wants cos/sin in repeat_interleave(2) layout, reshaped
-            # to (T, 1, 1, rope_dim); cos=real, sin=imag of the complex freqs_cis.
             rope_dim = compressor.rope_head_dim
-            # Use the same contig cache as the outer rope path; .real/.imag on a
-            # complex tensor are strided views and aclnnIndex over them triggers
-            # StridedSlice (see _get_contig_freqs_real_imag in deepseek_v4_rope.py).
             from sglang.srt.layers.deepseek_v4_rope import (
-                _get_contig_freqs_real_imag,
+                get_npu_interleaved_rope_cos_sin,
             )
 
-            freqs_real, freqs_imag = _get_contig_freqs_real_imag(compressor.freqs_cis)
-            cos_half = freqs_real[pos_out].to(kv_out.dtype)
-            sin_half = freqs_imag[pos_out].to(kv_out.dtype)
-            cos = (
-                cos_half.repeat_interleave(2, dim=-1)
-                .view(-1, 1, 1, rope_dim)
-                .contiguous()
-            )
-            sin = (
-                sin_half.repeat_interleave(2, dim=-1)
-                .view(-1, 1, 1, rope_dim)
-                .contiguous()
+            cos, sin = get_npu_interleaved_rope_cos_sin(
+                getattr(compressor, "rotary_emb", None),
+                compressor.freqs_cis,
+                pos_out,
+                kv_out.dtype,
+                view_4d=True,
+                allow_build=False,
+                cache_dtype=torch.float32,
             )
             rope_slice = kv_out[..., -rope_dim:]
             rope_view = rope_slice.unsqueeze(-2).unsqueeze(1)  # (T, 1, 1, rope_dim)
@@ -955,13 +950,41 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.layers.deepseek_v4_rope import v4_rope_inplace_npu
+        from sglang.srt.layers.deepseek_v4_rope import (
+            get_npu_interleaved_rope_cos_sin,
+            npu_partial_rotary_mul_inplace,
+        )
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
-        v4_rope_inplace_npu(
-            q, None, c4_indexer.freqs_cis, positions, qk_nope=self.qk_nope_head_dim
+        cos4 = getattr(c4_indexer.rotary_emb, "position_cos_layer_cache", None)
+        sin4 = getattr(c4_indexer.rotary_emb, "position_sin_layer_cache", None)
+        if (
+            cos4 is None
+            or sin4 is None
+            or cos4.shape[0] != positions.shape[0]
+            or sin4.shape[0] != positions.shape[0]
+            or cos4.dtype != q.dtype
+            or sin4.dtype != q.dtype
+            or cos4.device != positions.device
+            or sin4.device != positions.device
+        ):
+            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+                c4_indexer.rotary_emb,
+                c4_indexer.freqs_cis,
+                positions,
+                q.dtype,
+                view_4d=True,
+                allow_build=False,
+                cache_dtype=torch.float32,
+            )
+        npu_partial_rotary_mul_inplace(
+            q,
+            None,
+            cos4,
+            sin4,
+            qk_nope=c4_indexer.head_dim - c4_indexer.rope_head_dim,
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 
