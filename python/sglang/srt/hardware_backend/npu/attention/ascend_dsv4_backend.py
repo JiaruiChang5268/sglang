@@ -65,6 +65,34 @@ def _overlap_transform(
 
 class CompressorAscendBackendMixin(CompressorBackendMixin):
 
+    @staticmethod
+    def _to_cpu_int_list(values) -> Optional[list[int]]:
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            values = values.cpu().tolist()
+        return [int(v) for v in values]
+
+    def _extend_prefix_lens_cpu(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[list[int]]:
+        prefix_lens = self._to_cpu_int_list(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        )
+        if prefix_lens is not None:
+            return prefix_lens
+
+        seq_lens = self._to_cpu_int_list(getattr(forward_batch, "seq_lens_cpu", None))
+        extend_lens = self._to_cpu_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        if seq_lens is None or extend_lens is None or len(seq_lens) != len(extend_lens):
+            return None
+        return [
+            max(0, seq_len - extend_len)
+            for seq_len, extend_len in zip(seq_lens, extend_lens)
+        ]
+
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
@@ -119,7 +147,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
-        prefix_cpu = forward_batch.extend_prefix_lens_cpu
+        prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
         }
@@ -128,7 +156,11 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             end = int(cu_cpu[idx + 1])
             if end == start:
                 continue
-            prefix = int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+            prefix = (
+                int(prefix_cpu[idx])
+                if prefix_cpu is not None and idx < len(prefix_cpu)
+                else 0
+            )
             total = prefix + (end - start)
             for ratio in ratio_lists:
                 first_k = prefix // ratio
@@ -160,6 +192,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if forward_batch.extend_prefix_lens is not None:
             fm.start_pos = forward_batch.extend_prefix_lens.to(
                 device=device, dtype=torch.int32
+            )
+        elif prefix_cpu is not None:
+            fm.start_pos = torch.tensor(
+                prefix_cpu[:bs] + [0] * max(0, bs - len(prefix_cpu)),
+                dtype=torch.int32,
+                device=device,
             )
         else:
             fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
@@ -346,7 +384,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             # via get_state_cache, output via set_compress_buffer), and decode already
             # runs the indexer through them. So prefix_len>0 never reaches native ->
             # _forward_compress_native is non-chunked-only.
-            epl = forward_batch.extend_prefix_lens_cpu
+            epl = self._extend_prefix_lens_cpu(forward_batch)
             is_chunked = epl is not None and any(p > 0 for p in epl)
             if not is_chunked:
                 return self._forward_compress_native(compressor, x, forward_batch)
@@ -462,7 +500,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        extend_prefix_lens_cpu = self._extend_prefix_lens_cpu(forward_batch)
         is_prefill = forward_batch.forward_mode.is_prefill()
         token_to_kv_pool = self.token_to_kv_pool
         backend_fm = self.forward_metadata
@@ -566,7 +604,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 kv = kv_full[seqlen_offset : seqlen_offset + seqlen]
                 score = score_full[seqlen_offset : seqlen_offset + seqlen]
 
-                if overlap and cutoff >= ratio:
+                if overlap and should_compress:
                     # Stash the trailing ratio tokens of the cutoff so the next
                     # decode step can do overlap compression across the boundary
                     # (for ratio=4 this window is inside the state alloc range).
