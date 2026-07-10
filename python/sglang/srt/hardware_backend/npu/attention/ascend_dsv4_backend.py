@@ -10,6 +10,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_mtp_layout import (
+    build_dsv4_topk1_step_cache_locs,
+)
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.cp.base import get_cp_strategy
@@ -24,6 +27,21 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv4_mtp_loc_debug_enabled() -> bool:
+    """Enable MTP loc invariants, optionally on one world rank."""
+    flag = os.getenv("SGLANG_DSV4_NPU_MTP_LOC_DEBUG", "")
+    if flag.lower() not in ("1", "true", "yes", "on"):
+        return False
+
+    rank_filter = os.getenv("SGLANG_DSV4_NPU_MTP_LOC_DEBUG_RANK")
+    if rank_filter in (None, ""):
+        return True
+    try:
+        return int(rank_filter) == int(get_parallel().world_rank)
+    except ValueError:
+        return False
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -366,9 +384,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if not is_chunked:
                 return self._forward_compress_native(compressor, x, forward_batch)
 
-        from sglang.srt.layers.deepseek_v4_rope import (
-            get_fused_compressor_rope_cos_sin,
-        )
+        from sglang.srt.layers.deepseek_v4_rope import get_fused_compressor_rope_cos_sin
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -2161,8 +2177,15 @@ class DeepseekV4AscendMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
+        if topk != 1:
+            raise ValueError(
+                "DeepSeek-V4 Ascend MTP currently supports EAGLE topk=1 only; "
+                f"got topk={topk}."
+            )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self._mtp_loc_debug_logged = set()
         self.attn_backends = [
             DeepseekV4AscendAttnBackend(model_runner, speculative_step_id=step_id)
             for step_id in range(speculative_num_steps)
@@ -2202,78 +2225,67 @@ class DeepseekV4AscendMultiStepDraftBackend:
         if bundle is None or forward_batch.out_cache_loc is None:
             return None
 
-        step_width = forward_batch.batch_size * self.topk
-        total_width = step_width * self.speculative_num_steps
-        raw_total_width = bundle.out_full_loc.numel()
-        if (
-            raw_total_width < total_width
-            and raw_total_width % self.speculative_num_steps == 0
-            and (raw_total_width // self.speculative_num_steps) % self.topk == 0
-        ):
-            step_width = raw_total_width // self.speculative_num_steps
-            total_width = raw_total_width
-        if step_width == 0 or bundle.out_full_loc.numel() < total_width:
-            return bundle
+        validate = _dsv4_mtp_loc_debug_enabled()
+        step_locs = build_dsv4_topk1_step_cache_locs(
+            dense_full_locs=forward_batch.out_cache_loc,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            req_to_token_pool=self.req_to_token_pool,
+            step_id=step_id,
+            num_steps=self.speculative_num_steps,
+            padded_batch_size=forward_batch.batch_size,
+            validate=validate,
+        )
 
-        full_steps = bundle.out_full_loc[:total_width].reshape(
-            step_width // self.topk, self.topk, self.speculative_num_steps
-        )
-        full_steps = full_steps.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
-        swa_steps = bundle.out_swa_loc[:total_width].reshape(
-            step_width // self.topk, self.topk, self.speculative_num_steps
-        )
-        swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
-
-        def step_state(loc):
-            if loc is None or loc.numel() < total_width:
-                return loc
-            steps = loc[:total_width].reshape(
-                step_width // self.topk, self.topk, self.speculative_num_steps
+        if validate:
+            reserve_full_len = int(bundle.out_full_loc.numel())
+            reserve_swa_len = int(bundle.out_swa_loc.numel())
+            if reserve_full_len != reserve_swa_len:
+                raise RuntimeError(
+                    "DSV4 NPU MTP reserve bundle invariant failed: "
+                    f"full={reserve_full_len}, swa={reserve_swa_len}"
+                )
+            debug_key = (
+                step_id,
+                step_locs.real_batch_size,
+                step_locs.padded_batch_size,
+                reserve_full_len,
             )
-            return steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)[
-                step_id
-            ]
-
-        def step_compress(loc, ratio: int):
-            if loc is None or loc.numel() == 0:
-                return loc
-            raw_bs = step_width // self.topk
-            seq_lens = forward_batch.seq_lens[:raw_bs].to(torch.int64)
-            positions = seq_lens[:, None, None] + torch.arange(
-                self.speculative_num_steps,
-                device=seq_lens.device,
-                dtype=seq_lens.dtype,
-            )
-            positions = positions.expand(-1, self.topk, -1)
-            should_compress = ((positions + 1) % ratio) == 0
-            counts = should_compress.reshape(-1).to(torch.int64)
-            offsets = torch.cumsum(counts, dim=0) - counts
-            step_mask = should_compress[:, :, step_id].reshape(-1)
-            step_offsets = offsets.reshape(
-                raw_bs, self.topk, self.speculative_num_steps
-            )[:, :, step_id].reshape(-1)
-            return loc[step_offsets[step_mask].to(torch.int64)]
+            if debug_key not in self._mtp_loc_debug_logged:
+                self._mtp_loc_debug_logged.add(debug_key)
+                parallel = get_parallel()
+                logger.info(
+                    "DSV4 NPU MTP cache-loc invariant passed: world_rank=%d "
+                    "tp_rank=%d dp_rank=%d step=%d real_bs=%d graph_bs=%d "
+                    "dense_len=%d dense_req_stride=%d reserve_bundle_len=%d",
+                    parallel.world_rank,
+                    parallel.tp_rank,
+                    parallel.attn_dp_rank,
+                    step_id,
+                    step_locs.real_batch_size,
+                    step_locs.padded_batch_size,
+                    forward_batch.out_cache_loc.numel(),
+                    self.speculative_num_steps,
+                    reserve_full_len,
+                )
 
         return DSV4OutCacheLoc(
-            out_full_loc=full_steps[step_id],
-            out_swa_loc=swa_steps[step_id],
-            out_c4_loc=step_compress(bundle.out_c4_loc, 4),
-            out_c128_loc=step_compress(bundle.out_c128_loc, 128),
-            out_c4_state_loc=step_state(bundle.out_c4_state_loc),
-            out_c128_state_loc=step_state(bundle.out_c128_state_loc),
+            out_full_loc=step_locs.out_full_loc,
+            out_swa_loc=step_locs.out_swa_loc,
+            out_c4_loc=step_locs.out_c4_loc,
+            out_c128_loc=step_locs.out_c128_loc,
+            out_c4_state_loc=step_locs.out_c4_state_loc,
+            out_c128_state_loc=step_locs.out_c128_state_loc,
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
         old_out_cache_loc = forward_batch.out_cache_loc
         old_out_cache_loc_dsv4 = forward_batch.out_cache_loc_dsv4
         step_out_cache_loc = self._step_out_cache_loc(forward_batch, step_id)
+        step_out_cache_loc_dsv4 = self._step_out_cache_loc_dsv4(forward_batch, step_id)
         if step_out_cache_loc is not None:
             forward_batch.out_cache_loc = step_out_cache_loc
-        forward_batch.out_cache_loc_dsv4 = self._step_out_cache_loc_dsv4(
-            forward_batch, step_id
-        )
+        forward_batch.out_cache_loc_dsv4 = step_out_cache_loc_dsv4
         try:
             return call_fn()
         finally:
