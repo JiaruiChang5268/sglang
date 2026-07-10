@@ -985,27 +985,18 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
         qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
-        cos4 = getattr(c4_indexer.rotary_emb, "position_cos_layer_cache", None)
-        sin4 = getattr(c4_indexer.rotary_emb, "position_sin_layer_cache", None)
-        if (
-            cos4 is None
-            or sin4 is None
-            or cos4.shape[0] != positions.shape[0]
-            or sin4.shape[0] != positions.shape[0]
-            or cos4.dtype != q.dtype
-            or sin4.dtype != q.dtype
-            or cos4.device != positions.device
-            or sin4.device != positions.device
-        ):
-            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
-                c4_indexer.rotary_emb,
-                c4_indexer.freqs_cis,
-                positions,
-                q.dtype,
-                view_4d=True,
-                allow_build=False,
-                cache_dtype=torch.float32,
-            )
+        # Position-gathered RoPE values are forward-local.  The rotary embedding
+        # object is shared, so retaining them there can leak target positions into
+        # NextN (or a previous graph replay) when the next batch has the same shape.
+        cos4, sin4 = get_npu_interleaved_rope_cos_sin(
+            c4_indexer.rotary_emb,
+            c4_indexer.freqs_cis,
+            positions,
+            q.dtype,
+            view_4d=True,
+            allow_build=False,
+            cache_dtype=torch.float32,
+        )
         npu_partial_rotary_mul_inplace(
             q,
             None,

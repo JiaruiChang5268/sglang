@@ -503,36 +503,21 @@ class MQALayer(nn.Module):
     def _get_npu_rope_position_cache(
         self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        sin_attr = (
-            "inverse_position_sin_layer_cache"
-            if inverse
-            else "position_sin_layer_cache"
+        # ``rotary_emb`` is shared by layers with the same RoPE configuration and
+        # can also be shared by the target and NextN models.  Only cache the
+        # immutable full table on it.  A position-gathered tensor is specific to
+        # this forward and reusing it based on shape alone gives MTP decode the
+        # previous step's RoPE values when positions change but batch size does not.
+        return get_npu_interleaved_rope_cos_sin(
+            self.rotary_emb,
+            self.freqs_cis,
+            positions,
+            dtype,
+            view_4d=True,
+            inverse=inverse,
+            allow_build=False,
+            cache_dtype=torch.float32,
         )
-        cos4 = getattr(self.rotary_emb, "position_cos_layer_cache", None)
-        sin4 = getattr(self.rotary_emb, sin_attr, None)
-        if (
-            cos4 is None
-            or sin4 is None
-            or cos4.shape[0] != positions.shape[0]
-            or sin4.shape[0] != positions.shape[0]
-            or cos4.dtype != dtype
-            or sin4.dtype != dtype
-            or cos4.device != positions.device
-            or sin4.device != positions.device
-        ):
-            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
-                self.rotary_emb,
-                self.freqs_cis,
-                positions,
-                dtype,
-                view_4d=True,
-                inverse=inverse,
-                allow_build=False,
-                cache_dtype=torch.float32,
-            )
-            self.rotary_emb.position_cos_layer_cache = cos4
-            setattr(self.rotary_emb, sin_attr, sin4)
-        return cos4, sin4
 
     def _compute_q_a(
         self,
@@ -1973,38 +1958,6 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
-    def _prepare_npu_rope_position_caches(
-        self, positions: torch.Tensor, dtype: torch.dtype
-    ) -> None:
-        if not _is_npu:
-            return
-        seen_rotary_embs: Set[int] = set()
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            self_attn = getattr(layer, "self_attn", None)
-            if self_attn is None:
-                continue
-            rotary_emb = getattr(self_attn, "rotary_emb", None)
-            if rotary_emb is None:
-                continue
-            rotary_key = id(rotary_emb)
-            if rotary_key in seen_rotary_embs:
-                continue
-            seen_rotary_embs.add(rotary_key)
-
-            cos4, sin4 = get_npu_interleaved_rope_cos_sin(
-                rotary_emb,
-                self_attn.freqs_cis,
-                positions,
-                dtype,
-                view_4d=True,
-                allow_build=False,
-                cache_dtype=torch.float32,
-            )
-            rotary_emb.position_cos_layer_cache = cos4
-            rotary_emb.position_sin_layer_cache = sin4
-            rotary_emb.inverse_position_sin_layer_cache = -sin4
-
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
 
@@ -2159,7 +2112,6 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        self._prepare_npu_rope_position_caches(positions, hidden_states.dtype)
         if self._can_run_tbo(forward_batch):
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
