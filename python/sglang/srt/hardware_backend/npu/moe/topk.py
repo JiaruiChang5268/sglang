@@ -35,17 +35,22 @@ def fused_topk_npu(
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
     if topk_config.scoring_func == "sqrtsoftplus":
         if use_npu_moe_gating_top_k:
+            routed_scaling_factor = (
+                topk_config.routed_scaling_factor
+                if topk_config.apply_routed_scaling_factor_on_output
+                else 1.0
+            )
             topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
-                x=router_logits,
+                x=router_logits.to(torch.float32),
                 k=topk_config.top_k,
-                bias=correction_bias,
+                bias=(
+                    correction_bias.to(torch.float32)
+                    if correction_bias is not None
+                    else None
+                ),
                 input_ids=None,
                 tid2eid=None,
-                routed_scaling_factor=(
-                    topk_config.routed_scaling_factor
-                    if topk_config.apply_routed_scaling_factor_on_output
-                    else 1
-                ),
+                routed_scaling_factor=float(routed_scaling_factor),
                 norm_type=2,
             )
         else:
