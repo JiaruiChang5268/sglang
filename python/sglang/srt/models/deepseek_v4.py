@@ -313,6 +313,7 @@ class MQALayer(nn.Module):
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.n_heads = config.num_attention_heads
         self.n_local_heads = self.n_heads // attn_tp_size
+        #todo repeat权重，支持tp16
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // attn_tp_size
         self.rope_head_dim = config.qk_rope_head_dim
