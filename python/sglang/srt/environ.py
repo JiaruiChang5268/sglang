@@ -816,6 +816,11 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    # Experimental NPU fallback for lowering raw-SWA peak memory during DSV4
+    # prefill. A positive value enables chunked prefill at this effective
+    # per-DP token size; 0 keeps the regular server-argument behavior. The
+    # DSV4 override validates that the value is aligned to the NPU page size.
+    SGLANG_DSV4_NPU_SWA_PREFILL_CHUNK_SIZE = EnvInt(0)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
