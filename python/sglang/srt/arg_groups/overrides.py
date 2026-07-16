@@ -641,57 +641,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         page_size = 128
         overrides["prefill_attention_backend"] = "dsv4"
         overrides["decode_attention_backend"] = "dsv4"
-
-        # The Ascend PA prefill kernel needs raw SWA KV for every query row in
-        # the current extend. For a non-chunked 8K prompt this creates an 8K
-        # transient SWA allocation even though only the final 128-token window
-        # remains resident afterwards. Reuse the existing chunked-prefill path
-        # as the smallest correctness-preserving way to bound that peak: it
-        # keeps global cache positions and C4/C128 boundaries intact and frees
-        # out-of-window SWA pages between chunks.
-        from sglang.srt.environ import envs
-
-        swa_prefill_chunk_size = envs.SGLANG_DSV4_NPU_SWA_PREFILL_CHUNK_SIZE.get()
-        if swa_prefill_chunk_size < 0:
-            raise ValueError("SGLANG_DSV4_NPU_SWA_PREFILL_CHUNK_SIZE must be >= 0")
-        if swa_prefill_chunk_size > 0:
-            if swa_prefill_chunk_size % page_size != 0:
-                raise ValueError(
-                    "SGLANG_DSV4_NPU_SWA_PREFILL_CHUNK_SIZE must be a multiple "
-                    f"of the DSV4 NPU page size ({page_size}), got "
-                    f"{swa_prefill_chunk_size}"
-                )
-
-            configured_chunk_size = getattr(server_args, "chunked_prefill_size", None)
-            if configured_chunk_size in (None, -1):
-                # _handle_data_parallelism() divides chunked_prefill_size by
-                # dp_size. Interpret this experimental value as the effective
-                # per-DP chunk so a page-sized value stays page-sized after
-                # that normalization. Prefill CP enables DP attention later in
-                # the DSV4 hook even if the user did not spell it explicitly.
-                uses_dp_attention = getattr(
-                    server_args, "enable_dp_attention", False
-                ) or getattr(server_args, "enable_prefill_cp", False)
-                dp_size = getattr(server_args, "dp_size", 1)
-                declared_chunk_size = swa_prefill_chunk_size * (
-                    dp_size if uses_dp_attention else 1
-                )
-                overrides["chunked_prefill_size"] = declared_chunk_size
-                logger.warning(
-                    "Experimental DSV4 NPU SWA-bounded prefill is enabled: "
-                    "effective per-DP chunk=%d, declared chunked_prefill_size=%d "
-                    "(previous value: %s).",
-                    swa_prefill_chunk_size,
-                    declared_chunk_size,
-                    configured_chunk_size,
-                )
-            elif configured_chunk_size != swa_prefill_chunk_size:
-                logger.warning(
-                    "Ignoring SGLANG_DSV4_NPU_SWA_PREFILL_CHUNK_SIZE=%d because "
-                    "--chunked-prefill-size is already %d.",
-                    swa_prefill_chunk_size,
-                    configured_chunk_size,
-                )
     overrides["page_size"] = page_size
     logger.info(
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
