@@ -41,6 +41,51 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _npu_causal_conv1d_linear_verify(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_state_indices: torch.Tensor,
+    intermediate_conv_window: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Run linear-chain verify conv while preserving every rollback window.
+
+    The Ascend causal-conv wrapper does not expose the tree/scratch arguments
+    supported by the Triton implementation. DSpark verification is a linear
+    chain, so advancing one token at a time is equivalent and lets us save the
+    post-token window required by speculative state commit.
+    """
+    batch_size, _, num_tokens = x.shape
+    cache_indices = conv_state_indices[:batch_size]
+    scratch_indices = intermediate_state_indices[:batch_size]
+    state = conv_state.index_select(0, cache_indices)
+
+    if state.shape[-1] + 1 != weight.shape[-1]:
+        raise ValueError(
+            "KDA NPU verify conv window mismatch: "
+            f"state={state.shape[-1]}, weight={weight.shape[-1]}"
+        )
+
+    outputs = []
+    for step in range(num_tokens):
+        window = torch.cat((state, x[:, :, step : step + 1]), dim=-1)
+        out = torch.sum(window.to(weight.dtype) * weight.unsqueeze(0), dim=-1)
+        if bias is not None:
+            out = out + bias
+        out = torch.nn.functional.silu(out).to(x.dtype)
+        outputs.append(out.unsqueeze(-1))
+
+        state = window[:, :, 1:].to(conv_state.dtype)
+        intermediate_conv_window[:, step].index_copy_(
+            0, scratch_indices, state.to(intermediate_conv_window.dtype)
+        )
+
+    conv_state.index_copy_(0, cache_indices, state)
+    return torch.cat(outputs, dim=-1)
+
+
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -100,6 +145,9 @@ class KDAKernelDispatcher:
                 "(cutedsl prefill needs SM100)."
             )
 
+        # K3 DSpark target verify always uses the rollback-capable Triton
+        # kernel, independently from the decode/prefill backend.
+        self.verify_kernel = triton_kernel
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
@@ -166,6 +214,35 @@ class KDAKernelDispatcher:
             b,
             A_log=A_log,
             dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -325,6 +402,18 @@ def causal_conv1d_fn_npu_old(
     return out_ref_tensor
 
 
+def ragged_verify_dense_scatter_indices(
+    *, query_start_loc: torch.Tensor, seq_len: int, draft_token_num: int
+) -> torch.Tensor:
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
+
+
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -349,6 +438,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self._dspark_target_verify = model_runner.spec_algorithm.is_dspark()
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -552,6 +645,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self._dspark_target_verify and forward_batch.forward_mode.is_target_verify():
+            return self._forward_dspark_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            )
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -666,3 +763,102 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata,
             )
         return core_attn_out
+    def _forward_dspark_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        fm = self.forward_metadata
+        seq_len = mixed_qkv.shape[0]
+        query_start_loc = fm.query_start_loc
+        cache_indices = fm.mamba_cache_indices
+        retrieve_next_token = fm.retrieve_next_token
+        retrieve_next_sibling = fm.retrieve_next_sibling
+        retrieve_parent_token = fm.retrieve_parent_token
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        intermediate_state_cache = getattr(cache, "intermediate_ssm", None)
+        if intermediate_state_cache is None:
+            raise RuntimeError(
+                "KDA DSpark target verify requires speculative Mamba scratch."
+            )
+        conv_states = cache.conv[0]
+        ssm_states = cache.temporal
+        intermediate_conv = cache.intermediate_conv_window[0]
+        intermediate_indices = self.verify_intermediate_state_indices
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        ragged_layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+
+        batch_size = query_start_loc.shape[0] - 1
+        num_dense = batch_size * draft_token_num
+        if ragged_layout is None and seq_len == num_dense:
+            dense_indices = None
+            dense_qkv = mixed_qkv.view(batch_size, draft_token_num, -1)
+        else:
+            dense_indices = ragged_verify_dense_scatter_indices(
+                query_start_loc=query_start_loc,
+                seq_len=seq_len,
+                draft_token_num=draft_token_num,
+            )
+            dense = mixed_qkv.new_zeros(num_dense + 1, mixed_qkv.shape[-1])
+            dense.index_copy_(0, dense_indices, mixed_qkv)
+            dense_qkv = dense[:num_dense].view(batch_size, draft_token_num, -1)
+
+        if is_npu():
+            processed = _npu_causal_conv1d_linear_verify(
+                dense_qkv.transpose(1, 2),
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                cache_indices,
+                intermediate_conv,
+                intermediate_indices,
+            )
+        else:
+            processed = causal_conv1d_update(
+                dense_qkv.transpose(1, 2),
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv.transpose(-1, -2),
+                intermediate_state_indices=intermediate_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        flat = processed.transpose(1, 2).reshape(batch_size * draft_token_num, -1)
+        if dense_indices is not None:
+            padded = flat.new_zeros(flat.shape[0] + 1, flat.shape[1])
+            padded[: flat.shape[0]] = flat
+            flat = padded[dense_indices]
+
+        q, k, v = flat.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+        out = self.kernel_dispatcher.target_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_state_cache,
+            intermediate_state_indices=intermediate_indices,
+            cache_steps=draft_token_num,
+            retrieve_parent_token=retrieve_parent_token,
+            lower_bound=getattr(layer, "lower_bound", None),
+        )
+        if dense_indices is not None:
+            covered = dense_indices < (batch_size * draft_token_num)
+            out = torch.where(covered.view(1, -1, 1, 1), out, 0.0)
+        return out

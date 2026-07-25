@@ -2,10 +2,6 @@ import logging
 from typing import Optional, Union
 
 import torch
-from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-    conv_state_rollback,
-    move_intermediate_cache,
-)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -21,6 +17,42 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+
+def _move_intermediate_cache_torch(
+    dst_cache: torch.Tensor,
+    src_cache: torch.Tensor,
+    dst_indices: torch.Tensor,
+    src_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+) -> None:
+    """Commit selected speculative SSM snapshots without a large Triton tile."""
+    for i in range(step_indices.shape[0]):
+        step = int(step_indices[i].item())
+        if step < 0:
+            continue
+        dst = int(dst_indices[i].item())
+        src = int(src_indices[i].item())
+        dst_cache[:, dst].copy_(src_cache[:, src, step])
+
+
+def _conv_state_rollback_torch(
+    conv_states: torch.Tensor,
+    state_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+    draft_token_num: int,
+) -> None:
+    """Match conv_state_rollback while avoiding an oversized Ascend UB tile."""
+    for i in range(step_indices.shape[0]):
+        step = int(step_indices[i].item())
+        if step < 0:
+            continue
+        shift = (draft_token_num - 1) - step
+        if shift <= 0:
+            continue
+        state_idx = int(state_indices[i].item())
+        state = conv_states[:, state_idx]
+        state[:, shift:, :].copy_(state[:, :-shift, :].clone())
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):
@@ -259,7 +291,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
-        move_intermediate_cache(
+        _move_intermediate_cache_torch(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
@@ -273,7 +305,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             mamba_track_indices = mamba_track_indices.to(torch.int64)
             mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
 
-            move_intermediate_cache(
+            _move_intermediate_cache_torch(
                 ssm_states,
                 intermediate_state_cache,
                 mamba_track_indices,
@@ -291,7 +323,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 ]
 
         if dst_indices_tensor.numel() > 0:
-            conv_state_rollback(
+            _conv_state_rollback_torch(
                 conv_states,
                 dst_indices_tensor,
                 last_steps,
@@ -299,7 +331,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             )
 
         if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            conv_state_rollback(
+            _conv_state_rollback_torch(
                 conv_states,
                 mamba_track_indices,
                 mamba_steps_to_track,

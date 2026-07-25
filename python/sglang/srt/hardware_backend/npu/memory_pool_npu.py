@@ -20,19 +20,26 @@ if is_npu():
 
 
 def _init_npu_conv_state(
-    conv_state_in, conv_state_shape, speculative_num_draft_tokens: Optional[int] = None
+    conv_state_in,
+    conv_state_shape,
+    speculative_num_draft_tokens: Optional[int] = None,
+    is_kda: bool = False,
 ):
     extra_conv_len = 0
     if speculative_num_draft_tokens is not None:
         extra_conv_len = speculative_num_draft_tokens - 1
 
-    # conv_state shape (layers, pool_size, conv_wind + draft_step, dim) for conv1d ascendc ops require dim as last dim
+    # Mamba shapes are (channels, window), while KDA shapes are
+    # (window, channels). NPU kernels consume KDA state as
+    # [layers, pool, channels, window] and other Mamba state as
+    # [layers, pool, window, channels]. KDA keeps the base window fixed;
+    # speculative per-step windows live in the intermediate cache.
     conv_state = [
         torch.zeros(
             size=(
                 conv_state_in.shape[0],
                 conv_state_in.shape[1],
-                conv_shape[1] + extra_conv_len,
+                conv_shape[1] if is_kda else conv_shape[1] + extra_conv_len,
                 conv_shape[0],
             ),
             dtype=conv_state_in.dtype,

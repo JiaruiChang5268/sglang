@@ -7,8 +7,9 @@ sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 
-# MODEL_PATH=/home/zkk/weights/Kimi-K3-int4-layer10
-MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-8cards-quarot-all-0722-cutlayers
+MODEL_PATH=/home/zkk/weights/Kimi-K3-int4-layer10
+# MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-8cards-quarot-all-0722-cutlayers
+DRAFT_MODEL_PATH=/home/hanwlax/workspace/checkpoints/DSpark-Kimi-K3-layer6-smoke
 
 unset https_proxy
 unset http_proxy
@@ -34,6 +35,10 @@ export HCCL_OP_EXPANSION_MODE=AIV
 
 export PYTHONPATH=/home/hanwlax/workspace/sglang/python:$PYTHONPATH
 
+# mtp
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_SIMULATE_ACC_LEN=1.0
+
 sglang serve \
     --model-path $MODEL_PATH \
     --tokenizer-path $MODEL_PATH\
@@ -41,18 +46,26 @@ sglang serve \
     --attention-backend ascend \
     --device npu \
     --quantization modelslim \
-    --base-gpu-id 8 \
+    --base-gpu-id 12 \
     --dtype bfloat16 \
-    --tp-size 8 \
-    --mem-fraction-static 0.7 \
+    --tp-size 4 \
+    --mem-fraction-static 0.77 \
     --max-total-tokens 65536 \
     --page-size 128 \
-    --chunked-prefill-size -1 \
+    --chunked-prefill-size 2048 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --disable-cuda-graph \
     --host 0.0.0.0 \
     --port 8880 \
-    --enable-multimodal --mm-enable-dp-encoder --mm-attention-backend ascend_attn
+    --disable-radix-cache \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+    --speculative-dspark-block-size 1 \
+    --speculative-draft-attention-backend ascend \
+    --speculative-eagle-topk 1 \
+    --speculative-draft-model-quantization unquant \
+    --enable-multimodal --mm-enable-dp-encoder --mm-attention-backend ascend_attn \
+    2>&1 | tee "logs/dspark_$(date '+%Y-%m-%dT%H-%M-%S-%3N').log"
 
 exit 1
