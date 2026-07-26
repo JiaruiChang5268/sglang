@@ -32,6 +32,10 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    debug_base_top_tokens: Optional[torch.Tensor] = None
+    debug_base_top_values: Optional[torch.Tensor] = None
+    debug_markov_bias_max_abs: Optional[torch.Tensor] = None
+    debug_markov_bias_mean_abs: Optional[torch.Tensor] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -206,11 +210,29 @@ def sample_draft_block(
         hidden_states=draft_hidden,
         sampler=sampler,
     )
+    debug_base_top_tokens = None
+    debug_base_top_values = None
+    debug_markov_bias_max_abs = None
+    debug_markov_bias_mean_abs = None
+    if envs.SGLANG_DSPARK_DEBUG_TRACE.get() and base_logits.numel() > 0:
+        base_first_step = base_logits[:, 0, :].float()
+        corrected_first_step = corrected_logits[:, 0, :].float()
+        debug_base_top_values, debug_base_top_tokens = base_first_step.topk(
+            k=min(5, base_first_step.shape[-1]), dim=-1
+        )
+        markov_bias_abs = (corrected_first_step - base_first_step).abs()
+        debug_markov_bias_max_abs = markov_bias_abs.amax(dim=-1)
+        debug_markov_bias_mean_abs = markov_bias_abs.mean(dim=-1)
+
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=corrected_logits,
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        debug_base_top_tokens=debug_base_top_tokens,
+        debug_base_top_values=debug_base_top_values,
+        debug_markov_bias_max_abs=debug_markov_bias_max_abs,
+        debug_markov_bias_mean_abs=debug_markov_bias_mean_abs,
     )
 
 

@@ -376,6 +376,9 @@ class DSparkDraftMixin:
         self.lm_head: Optional[nn.Module] = None
         self._debug_target_hidden_kv_calls = 0
 
+    def reset_debug_target_hidden_kv_trace(self) -> None:
+        self._debug_target_hidden_kv_calls = 0
+
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
@@ -524,8 +527,25 @@ class DSparkDraftMixin:
             actual_indices = valid_cache_locs.to(
                 device=actual_k_buffer.device, dtype=torch.int64
             )
-            actual_k = actual_k_buffer.index_select(0, actual_indices)
-            actual_v = actual_v_buffer.index_select(0, actual_indices)
+            if actual_k_buffer.ndim == expected_k.ndim:
+                cache_layout = "flat"
+                page_size = 1
+                actual_k = actual_k_buffer.index_select(0, actual_indices)
+                actual_v = actual_v_buffer.index_select(0, actual_indices)
+            elif actual_k_buffer.ndim == expected_k.ndim + 1:
+                cache_layout = "paged"
+                page_size = int(actual_k_buffer.shape[1])
+                page_indices = torch.div(
+                    actual_indices, page_size, rounding_mode="floor"
+                )
+                page_offsets = torch.remainder(actual_indices, page_size)
+                actual_k = actual_k_buffer[page_indices, page_offsets]
+                actual_v = actual_v_buffer[page_indices, page_offsets]
+            else:
+                raise ValueError(
+                    "Unsupported DSpark debug KV buffer layout: "
+                    f"{tuple(actual_k_buffer.shape)=} {tuple(expected_k.shape)=}."
+                )
 
             same_shape = (
                 actual_k.shape == expected_k.shape
@@ -549,7 +569,8 @@ class DSparkDraftMixin:
             locs_host = valid_cache_locs.detach().cpu()
             logger.warning(
                 "DSpark debug KV: write_kind=%s layer=%s valid_rows=%s "
-                "loc_range=[%s,%s] expected_k_shape=%s actual_k_shape=%s "
+                "loc_range=[%s,%s] cache_layout=%s page_size=%s "
+                "expected_k_shape=%s actual_k_shape=%s "
                 "expected_v_shape=%s actual_v_shape=%s "
                 "k_max_abs_diff=%.8g k_mean_abs_diff=%.8g "
                 "v_max_abs_diff=%.8g v_mean_abs_diff=%.8g",
@@ -558,6 +579,8 @@ class DSparkDraftMixin:
                 int(valid_cache_locs.numel()),
                 int(locs_host.min().item()),
                 int(locs_host.max().item()),
+                cache_layout,
+                page_size,
                 tuple(expected_k.shape),
                 tuple(actual_k.shape),
                 tuple(expected_v.shape),

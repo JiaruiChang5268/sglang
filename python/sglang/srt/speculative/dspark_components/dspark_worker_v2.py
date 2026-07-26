@@ -120,8 +120,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._debug_prefill_trace_calls = 0
-        self._debug_verify_trace_steps = 0
+        self._debug_prefill_trace_rids: dict[str, None] = {}
+        self._debug_verify_trace_ct_by_rid: dict[str, int] = {}
 
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
@@ -437,6 +437,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        if envs.SGLANG_DSPARK_DEBUG_TRACE.get():
+            self.draft_model.reset_debug_target_hidden_kv_trace()
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
@@ -508,15 +510,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             and get_parallel().attn_tp_rank == 0
         )
 
+    @staticmethod
+    def _debug_batch_rids(batch: ScheduleBatch, bs: int) -> list[str]:
+        reqs = getattr(batch, "reqs", None) or []
+        return [
+            str(getattr(reqs[row], "rid", f"unknown-row-{row}"))
+            if row < len(reqs)
+            else f"unknown-row-{row}"
+            for row in range(bs)
+        ]
+
+    @staticmethod
+    def _debug_remember_bounded(mapping: dict, key, value, limit: int = 64) -> None:
+        if key not in mapping and len(mapping) >= limit:
+            mapping.pop(next(iter(mapping)))
+        mapping[key] = value
+
     def _maybe_log_prefill_cache_mapping(
         self,
         *,
         batch: ScheduleBatch,
         positions: torch.Tensor,
     ) -> None:
-        if not self._debug_trace_enabled() or self._debug_prefill_trace_calls >= 4:
+        if not self._debug_trace_enabled():
             return
-        self._debug_prefill_trace_calls += 1
+        rids = self._debug_batch_rids(batch, len(batch.seq_lens))
+        new_rids = [rid for rid in rids if rid not in self._debug_prefill_trace_rids]
+        if not new_rids:
+            return
+        for rid in new_rids:
+            self._debug_remember_bounded(self._debug_prefill_trace_rids, rid, None)
         try:
             extend_lens = torch.tensor(
                 batch.extend_lens, dtype=torch.int64, device=positions.device
@@ -538,11 +561,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 (mapped_cache_locs != out_cache_locs).sum().item()
             )
             logger.warning(
-                "DSpark debug prefill mapping: dp_rank=%s rows=%s "
+                "DSpark debug prefill mapping: dp_rank=%s rids=%s rows=%s "
                 "num_loc_mismatches=%s shared_req_to_token_pool=%s "
                 "shared_token_to_kv_pool=%s positions=[%s,%s] "
                 "cache_locs=[%s,%s]",
                 self.dp_rank,
+                rids,
                 int(out_cache_locs.numel()),
                 num_loc_mismatches,
                 self.draft_model_runner.req_to_token_pool is req_to_token_pool,
@@ -566,42 +590,133 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_tokens: torch.Tensor,
         accept,
     ) -> None:
-        if not self._debug_trace_enabled() or self._debug_verify_trace_steps >= 8:
+        if not self._debug_trace_enabled():
             return
-        self._debug_verify_trace_steps += 1
-        row_limit = min(int(draft_tokens.shape[0]), 2)
-        draft_tokens_host = draft_tokens[:row_limit].detach().cpu().tolist()
-        bonus_tokens_host = accept.bonus[:row_limit].detach().cpu().tolist()
-        correct_lens_host = accept.correct_len[:row_limit].detach().cpu().tolist()
-        commit_lens_host = accept.commit_lens[:row_limit].detach().cpu().tolist()
+        rids = self._debug_batch_rids(batch, int(draft_tokens.shape[0]))
+        selected_rows = [
+            row
+            for row, rid in enumerate(rids)
+            if self._debug_verify_trace_ct_by_rid.get(rid, 0) < 8
+        ][:2]
+        if not selected_rows:
+            return
+        selected_rids = [rids[row] for row in selected_rows]
+        for rid in selected_rids:
+            trace_ct = self._debug_verify_trace_ct_by_rid.get(rid, 0) + 1
+            self._debug_remember_bounded(
+                self._debug_verify_trace_ct_by_rid, rid, trace_ct
+            )
+
+        selected_indices = torch.tensor(
+            selected_rows, dtype=torch.int64, device=draft_tokens.device
+        )
+        draft_tokens_host = (
+            draft_tokens.index_select(0, selected_indices).detach().cpu().tolist()
+        )
+        bonus_tokens_host = (
+            accept.bonus.index_select(0, selected_indices).detach().cpu().tolist()
+        )
+        correct_lens_host = (
+            accept.correct_len.index_select(0, selected_indices)
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        commit_lens_host = (
+            accept.commit_lens.index_select(0, selected_indices)
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        anchor_tokens_host = (
+            proposal.draft_block_ids.index_select(0, selected_indices)[:, 0]
+            .detach()
+            .cpu()
+            .tolist()
+        )
         draft_top_tokens = None
         draft_top_values = None
         corrected_logits = proposal.draft_block.corrected_logits
         if corrected_logits is not None and corrected_logits.numel() > 0:
-            top_values, top_tokens = corrected_logits[
-                :row_limit, 0, :
-            ].float().topk(k=5, dim=-1)
+            selected_logits = corrected_logits.index_select(0, selected_indices)
+            top_values, top_tokens = selected_logits[:, 0, :].float().topk(
+                k=5, dim=-1
+            )
             draft_top_tokens = top_tokens.detach().cpu().tolist()
             draft_top_values = top_values.detach().cpu().tolist()
 
-        draft_hidden = proposal.draft_hidden[:row_limit].float()
+        draft_block = proposal.draft_block
+        base_top_tokens = (
+            None
+            if draft_block.debug_base_top_tokens is None
+            else draft_block.debug_base_top_tokens.index_select(
+                0, selected_indices
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        base_top_values = (
+            None
+            if draft_block.debug_base_top_values is None
+            else draft_block.debug_base_top_values.index_select(
+                0, selected_indices
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        markov_bias_max_abs = (
+            None
+            if draft_block.debug_markov_bias_max_abs is None
+            else draft_block.debug_markov_bias_max_abs.index_select(
+                0, selected_indices
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        markov_bias_mean_abs = (
+            None
+            if draft_block.debug_markov_bias_mean_abs is None
+            else draft_block.debug_markov_bias_mean_abs.index_select(
+                0, selected_indices
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        draft_hidden = proposal.draft_hidden.index_select(
+            0, selected_indices
+        ).float()
         logger.warning(
-            "DSpark debug verify: dp_rank=%s forward_ct=%s bs=%s folded=%s "
-            "draft_tokens=%s bonus_tokens=%s num_correct_drafts=%s "
-            "commit_lens=%s first_step_top_tokens=%s "
-            "first_step_top_values=%s draft_hidden_finite=%s "
+            "DSpark debug verify: dp_rank=%s forward_ct=%s rids=%s bs=%s "
+            "folded=%s anchor_tokens=%s draft_tokens=%s bonus_tokens=%s "
+            "num_correct_drafts=%s commit_lens=%s "
+            "base_first_step_top_tokens=%s base_first_step_top_values=%s "
+            "corrected_first_step_top_tokens=%s "
+            "corrected_first_step_top_values=%s "
+            "markov_bias_max_abs=%s markov_bias_mean_abs=%s "
+            "draft_hidden_finite=%s "
             "draft_hidden_min=%.8g draft_hidden_max=%.8g "
             "draft_hidden_mean_abs=%.8g",
             self.dp_rank,
             int(batch.forward_iter),
+            selected_rids,
             len(batch.seq_lens),
             proposal.folded,
+            anchor_tokens_host,
             draft_tokens_host,
             bonus_tokens_host,
             correct_lens_host,
             commit_lens_host,
+            base_top_tokens,
+            base_top_values,
             draft_top_tokens,
             draft_top_values,
+            markov_bias_max_abs,
+            markov_bias_mean_abs,
             bool(torch.isfinite(draft_hidden).all().item()),
             float(draft_hidden.min().item()),
             float(draft_hidden.max().item()),
