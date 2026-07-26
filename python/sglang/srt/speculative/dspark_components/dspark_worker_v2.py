@@ -120,6 +120,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._debug_prefill_trace_calls = 0
+        self._debug_verify_trace_steps = 0
 
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
@@ -316,7 +318,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        # capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = False
+
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -439,6 +443,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
         )
         logits_output.hidden_states = None
+        self._maybe_log_prefill_cache_mapping(
+            batch=batch,
+            positions=positions,
+        )
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -492,6 +500,112 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=False,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=next_draft_input.new_seq_lens,
+        )
+
+    def _debug_trace_enabled(self) -> bool:
+        return (
+            envs.SGLANG_DSPARK_DEBUG_TRACE.get()
+            and get_parallel().attn_tp_rank == 0
+        )
+
+    def _maybe_log_prefill_cache_mapping(
+        self,
+        *,
+        batch: ScheduleBatch,
+        positions: torch.Tensor,
+    ) -> None:
+        if not self._debug_trace_enabled() or self._debug_prefill_trace_calls >= 4:
+            return
+        self._debug_prefill_trace_calls += 1
+        try:
+            extend_lens = torch.tensor(
+                batch.extend_lens, dtype=torch.int64, device=positions.device
+            )
+            req_pool_indices = batch.req_pool_indices.to(
+                device=positions.device, dtype=torch.int64
+            )
+            token_req_pool_indices = torch.repeat_interleave(
+                req_pool_indices, extend_lens
+            )
+            req_to_token_pool = self.model_runner.req_to_token_pool
+            mapped_cache_locs = req_to_token_pool.req_to_token[
+                token_req_pool_indices, positions.to(torch.int64)
+            ]
+            out_cache_locs = batch.out_cache_loc.to(
+                device=mapped_cache_locs.device, dtype=mapped_cache_locs.dtype
+            )
+            num_loc_mismatches = int(
+                (mapped_cache_locs != out_cache_locs).sum().item()
+            )
+            logger.warning(
+                "DSpark debug prefill mapping: dp_rank=%s rows=%s "
+                "num_loc_mismatches=%s shared_req_to_token_pool=%s "
+                "shared_token_to_kv_pool=%s positions=[%s,%s] "
+                "cache_locs=[%s,%s]",
+                self.dp_rank,
+                int(out_cache_locs.numel()),
+                num_loc_mismatches,
+                self.draft_model_runner.req_to_token_pool is req_to_token_pool,
+                self.draft_model_runner.token_to_kv_pool
+                is self.model_runner.token_to_kv_pool,
+                int(positions.min().item()),
+                int(positions.max().item()),
+                int(out_cache_locs.min().item()),
+                int(out_cache_locs.max().item()),
+            )
+        except Exception:
+            logger.exception(
+                "DSpark debug prefill cache mapping failed; inference is unchanged."
+            )
+
+    def _maybe_log_verify_trace(
+        self,
+        *,
+        batch: ScheduleBatch,
+        proposal,
+        draft_tokens: torch.Tensor,
+        accept,
+    ) -> None:
+        if not self._debug_trace_enabled() or self._debug_verify_trace_steps >= 8:
+            return
+        self._debug_verify_trace_steps += 1
+        row_limit = min(int(draft_tokens.shape[0]), 2)
+        draft_tokens_host = draft_tokens[:row_limit].detach().cpu().tolist()
+        bonus_tokens_host = accept.bonus[:row_limit].detach().cpu().tolist()
+        correct_lens_host = accept.correct_len[:row_limit].detach().cpu().tolist()
+        commit_lens_host = accept.commit_lens[:row_limit].detach().cpu().tolist()
+        draft_top_tokens = None
+        draft_top_values = None
+        corrected_logits = proposal.draft_block.corrected_logits
+        if corrected_logits is not None and corrected_logits.numel() > 0:
+            top_values, top_tokens = corrected_logits[
+                :row_limit, 0, :
+            ].float().topk(k=5, dim=-1)
+            draft_top_tokens = top_tokens.detach().cpu().tolist()
+            draft_top_values = top_values.detach().cpu().tolist()
+
+        draft_hidden = proposal.draft_hidden[:row_limit].float()
+        logger.warning(
+            "DSpark debug verify: dp_rank=%s forward_ct=%s bs=%s folded=%s "
+            "draft_tokens=%s bonus_tokens=%s num_correct_drafts=%s "
+            "commit_lens=%s first_step_top_tokens=%s "
+            "first_step_top_values=%s draft_hidden_finite=%s "
+            "draft_hidden_min=%.8g draft_hidden_max=%.8g "
+            "draft_hidden_mean_abs=%.8g",
+            self.dp_rank,
+            int(batch.forward_iter),
+            len(batch.seq_lens),
+            proposal.folded,
+            draft_tokens_host,
+            bonus_tokens_host,
+            correct_lens_host,
+            commit_lens_host,
+            draft_top_tokens,
+            draft_top_values,
+            bool(torch.isfinite(draft_hidden).all().item()),
+            float(draft_hidden.min().item()),
+            float(draft_hidden.max().item()),
+            float(draft_hidden.abs().mean().item()),
         )
 
     def _forward_decode(
@@ -634,6 +748,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        self._maybe_log_verify_trace(
+            batch=batch,
+            proposal=proposal,
+            draft_tokens=draft_tokens,
+            accept=accept,
         )
         if on_publish is not None:
             if confidence is not None:

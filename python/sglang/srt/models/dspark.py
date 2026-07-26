@@ -7,8 +7,10 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
@@ -372,6 +374,7 @@ class DSparkDraftMixin:
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        self._debug_target_hidden_kv_calls = 0
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
@@ -458,6 +461,117 @@ class DSparkDraftMixin:
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    def _maybe_debug_target_hidden_kv(
+        self,
+        *,
+        pool,
+        attn,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        if (
+            not envs.SGLANG_DSPARK_DEBUG_TRACE.get()
+            or self._debug_target_hidden_kv_calls >= 4
+            or get_parallel().attn_tp_rank != 0
+        ):
+            return
+
+        self._debug_target_hidden_kv_calls += 1
+        write_kind = (
+            "commit"
+            if cache_loc_2d is not None and commit_lens is not None
+            else "prefill"
+        )
+        try:
+            if write_kind == "commit":
+                row_offsets = torch.arange(
+                    cache_loc_2d.shape[1],
+                    dtype=torch.int64,
+                    device=commit_lens.device,
+                )
+                valid_mask = (
+                    row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+                )
+                valid_indices = torch.nonzero(
+                    valid_mask.reshape(-1), as_tuple=False
+                ).flatten()
+                valid_cache_locs = cache_loc_2d.reshape(-1).index_select(
+                    0, valid_indices.to(cache_loc_2d.device)
+                )
+                expected_k = k.index_select(0, valid_indices.to(k.device))
+                expected_v = v.index_select(0, valid_indices.to(v.device))
+            else:
+                valid_cache_locs = cache_loc.reshape(-1)
+                expected_k = k
+                expected_v = v
+
+            if valid_cache_locs.numel() == 0:
+                logger.warning(
+                    "DSpark debug KV: write_kind=%s layer=%s valid_rows=0",
+                    write_kind,
+                    attn.attn.layer_id,
+                )
+                return
+
+            device_module = torch.get_device_module(k.device)
+            device_module.synchronize(k.device)
+            actual_k_buffer, actual_v_buffer = pool.get_kv_buffer(
+                attn.attn.layer_id
+            )
+            actual_indices = valid_cache_locs.to(
+                device=actual_k_buffer.device, dtype=torch.int64
+            )
+            actual_k = actual_k_buffer.index_select(0, actual_indices)
+            actual_v = actual_v_buffer.index_select(0, actual_indices)
+
+            same_shape = (
+                actual_k.shape == expected_k.shape
+                and actual_v.shape == expected_v.shape
+            )
+            if same_shape:
+                k_abs_diff = (
+                    actual_k.float() - expected_k.to(actual_k.device).float()
+                ).abs()
+                v_abs_diff = (
+                    actual_v.float() - expected_v.to(actual_v.device).float()
+                ).abs()
+                k_max_abs_diff = float(k_abs_diff.max().item())
+                v_max_abs_diff = float(v_abs_diff.max().item())
+                k_mean_abs_diff = float(k_abs_diff.mean().item())
+                v_mean_abs_diff = float(v_abs_diff.mean().item())
+            else:
+                k_max_abs_diff = v_max_abs_diff = float("nan")
+                k_mean_abs_diff = v_mean_abs_diff = float("nan")
+
+            locs_host = valid_cache_locs.detach().cpu()
+            logger.warning(
+                "DSpark debug KV: write_kind=%s layer=%s valid_rows=%s "
+                "loc_range=[%s,%s] expected_k_shape=%s actual_k_shape=%s "
+                "expected_v_shape=%s actual_v_shape=%s "
+                "k_max_abs_diff=%.8g k_mean_abs_diff=%.8g "
+                "v_max_abs_diff=%.8g v_mean_abs_diff=%.8g",
+                write_kind,
+                attn.attn.layer_id,
+                int(valid_cache_locs.numel()),
+                int(locs_host.min().item()),
+                int(locs_host.max().item()),
+                tuple(expected_k.shape),
+                tuple(actual_k.shape),
+                tuple(expected_v.shape),
+                tuple(actual_v.shape),
+                k_max_abs_diff,
+                k_mean_abs_diff,
+                v_max_abs_diff,
+                v_mean_abs_diff,
+            )
+        except Exception:
+            logger.exception(
+                "DSpark debug KV comparison failed; inference is left unchanged."
+            )
+
     def write_target_hidden_kv(
         self,
         *,
@@ -494,6 +608,16 @@ class DSparkDraftMixin:
                     v,
                     attn.attn.k_scale,
                     attn.attn.v_scale,
+                )
+            if layer is self.layers[0]:
+                self._maybe_debug_target_hidden_kv(
+                    pool=pool,
+                    attn=attn,
+                    k=k,
+                    v=v,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
                 )
 
 
