@@ -30,8 +30,10 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
+set +u
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+set -u
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_SOCKET_IFNAME=lo
