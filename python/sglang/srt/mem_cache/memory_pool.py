@@ -1845,7 +1845,7 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-        if not (_is_cuda or _is_hip):
+        if not (_is_cuda or _is_hip or _is_npu):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
