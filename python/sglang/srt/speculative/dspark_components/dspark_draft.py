@@ -371,6 +371,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
+        draft_num_tokens = bs * gamma
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -385,6 +386,10 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=torch.tensor(
+                draft_num_tokens, dtype=torch.int32, device=device
+            ),
+            num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         with torch.inference_mode():
@@ -404,6 +409,10 @@ class DraftBlockProposer:
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
+        # Draft 与 Target 使用同一组真实请求。即使 Draft 不是 DP-MoE，
+        # attention TP gather 的 graph eligibility 也必须继承。
+        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = (
@@ -418,4 +427,3 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
