@@ -1105,23 +1105,18 @@ class KimiLinearModel(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Return the pre-norm stream consumed after ``layer_idx``."""
+        """Return the Transformers-compatible output of ``layer_idx``.
+
+        The Kimi Transformers model records output index 0 from each
+        ``KimiDecoderLayer``.  With attention residuals that value is the
+        layer's ``prefix_sum``, represented here by ``hidden_states``.  Applying
+        the next layer's attention-residual projection would instead capture
+        that next layer's pre-norm input, which does not match the DSpark
+        checkpoint's ``output.hidden_states[layer_idx + 1]`` training feature.
+        """
         if not self.use_attn_residuals:
             return hidden_states if residual is None else hidden_states + residual
-        if layer_idx + 1 < self.end_layer:
-            next_layer = self.layers[layer_idx + 1]
-            return apply_attn_res(
-                hidden_states,
-                residual,
-                next_layer.self_attention_res_proj,
-                next_layer.self_attention_res_norm,
-            )
-        return apply_attn_res(
-            hidden_states,
-            residual,
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-        )
+        return hidden_states
 
 
 class KimiK3ForCausalLM(nn.Module):
@@ -1164,6 +1159,12 @@ class KimiK3ForCausalLM(nn.Module):
             raise ValueError("DSPARK requires explicit layer_ids for aux hidden capture.")
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+        if get_parallel().attn_tp_rank == 0:
+            logger.info(
+                "DSpark K3 aux hidden capture: mode=raw_decoder_layer_output "
+                "layer_ids=%s semantics=output.hidden_states[layer_id + 1]",
+                layer_ids,
+            )
 
     @property
     def start_layer(self) -> int:
