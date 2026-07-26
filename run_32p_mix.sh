@@ -12,7 +12,7 @@ export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 SGLANG_ROOT=${SGLANG_ROOT:-/home/hanwlax/workspace/sglang}
 MODEL_PATH=${MODEL_PATH:-/home/weights/Kimi-K3-w4a8-int-8cards-quarot-all-0722}
 DRAFT_MODEL_PATH=${DRAFT_MODEL_PATH:-/home/weights/DSpark-Kimi-K3-yi}
-MASTER_ADDR=${MASTER_ADDR:-192.168.25.209}
+MASTER_ADDR=${MASTER_ADDR:-192.168.25.213}
 MASTER_PORT=${MASTER_PORT:-5000}
 SERVER_PORT=${SERVER_PORT:-30000}
 COMM_IF=${COMM_IF:-enp196s0f0}
@@ -52,7 +52,7 @@ unset SGLANG_SIMULATE_ACC_LEN
 # installed sgl_kernel_npu package is still used by unrelated Ascend kernels.
 export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 
-D_IP=('192.168.25.209' '192.168.25.212' '192.168.25.216' '192.168.25.217')
+D_IP=('192.168.25.213' '192.168.25.214' '192.168.25.215' '192.168.25.218')
 LOCAL_IPS=" $(hostname -I) "
 NODE_RANK=-1
 for i in "${!D_IP[@]}"; do
