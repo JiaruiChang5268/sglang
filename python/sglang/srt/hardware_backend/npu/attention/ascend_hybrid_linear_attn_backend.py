@@ -16,10 +16,15 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
+from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+    conv_state_rollback,
+    speculative_state_scatter_npu,
+)
+
 logger = logging.getLogger(__name__)
 
 
-def _move_intermediate_cache_torch(
+def speculative_state_scatter_npu(
     dst_cache: torch.Tensor,
     src_cache: torch.Tensor,
     dst_indices: torch.Tensor,
@@ -36,7 +41,7 @@ def _move_intermediate_cache_torch(
         dst_cache[:, dst].copy_(src_cache[:, src, step])
 
 
-def _conv_state_rollback_torch(
+def conv_state_rollback(
     conv_states: torch.Tensor,
     state_indices: torch.Tensor,
     step_indices: torch.Tensor,
@@ -283,15 +288,15 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
+        dst_indices_tensor = state_indices_tensor.to(torch.int32)  # [N]
         src_indices_tensor = torch.arange(
             dst_indices_tensor.shape[0],
             device=dst_indices_tensor.device,
             dtype=torch.int64,
         )
-        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        last_steps = last_correct_step_indices.to(torch.int32)  # [N]
 
-        _move_intermediate_cache_torch(
+        speculative_state_scatter_npu(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
@@ -307,7 +312,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             intermediate_conv_window_cache = (
                 mamba_caches.intermediate_conv_window[0]
             )
-            _move_intermediate_cache_torch(
+            speculative_state_scatter_npu(
                 conv_states,
                 intermediate_conv_window_cache,
                 dst_indices_tensor,
@@ -320,7 +325,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             mamba_track_indices = mamba_track_indices.to(torch.int64)
             mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
 
-            _move_intermediate_cache_torch(
+            speculative_state_scatter_npu(
                 ssm_states,
                 intermediate_state_cache,
                 mamba_track_indices,
@@ -329,7 +334,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             )
 
             if use_dspark_conv_snapshots:
-                _move_intermediate_cache_torch(
+                speculative_state_scatter_npu(
                     conv_states,
                     intermediate_conv_window_cache,
                     mamba_track_indices,
@@ -349,7 +354,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
 
         if not use_dspark_conv_snapshots:
             if dst_indices_tensor.numel() > 0:
-                _conv_state_rollback_torch(
+                conv_state_rollback(
                     conv_states,
                     dst_indices_tensor,
                     last_steps,
@@ -357,7 +362,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 )
 
             if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-                _conv_state_rollback_torch(
+                conv_state_rollback(
                     conv_states,
                     mamba_track_indices,
                     mamba_steps_to_track,

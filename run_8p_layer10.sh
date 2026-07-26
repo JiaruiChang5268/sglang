@@ -33,7 +33,8 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
 export HCCL_BUFFSIZE=1600
 export HCCL_OP_EXPANSION_MODE=AIV
 
-export PYTHONPATH=/home/hanwlax/workspace/sglang/python:$PYTHONPATH
+# export PYTHONPATH=/home/hanwlax/workspace/sglang/python:$PYTHONPATH
+export PYTHONPATH=/home/hanwlax/workspace/sgl-kernel-npu/python/sgl_kernel_npu:/home/hanwlax/workspace/sglang/python:${PYTHONPATH:-}
 
 # dspark
 export SGLANG_RAGGED_VERIFY_MODE=static

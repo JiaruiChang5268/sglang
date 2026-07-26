@@ -30,6 +30,10 @@ if is_npu():
         causal_conv1d_update_npu,
     )
 
+    from sgl_kernel_npu.mamba.causal_conv1d_verify import (
+        causal_conv1d_linear_verify_npu,
+    )
+
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
 elif is_cpu():
@@ -808,14 +812,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             dense_qkv = dense[:num_dense].view(batch_size, draft_token_num, -1)
 
         if is_npu():
-            processed = _npu_causal_conv1d_linear_verify(
-                dense_qkv.transpose(1, 2),
+            processed = causal_conv1d_linear_verify_npu(
+                dense_qkv.transpose(1, 2).contiguous(),
                 conv_states,
                 layer.conv_weights,
                 layer.bias,
-                cache_indices,
+                cache_indices[:batch_size],
                 intermediate_conv,
-                intermediate_indices,
+                intermediate_indices[:batch_size],
+                activation="silu",
+                update_persistent_state=False,
             )
         else:
             processed = causal_conv1d_update(
