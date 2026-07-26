@@ -269,15 +269,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={server_args.attn_cp_size})."
             )
-        if (
-            server_args.speculative_moe_a2a_backend is not None
-            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
-        ):
-            raise ValueError(
-                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
-                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
-                f"(got {server_args.speculative_moe_a2a_backend!r})."
-            )
+        # if (
+        #     server_args.speculative_moe_a2a_backend is not None
+        #     and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
+        # ):
+        #     raise ValueError(
+        #         "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
+        #         f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
+        #         f"(got {server_args.speculative_moe_a2a_backend!r})."
+        #     )
 
     if server_args.pp_size != 1:
         raise ValueError(
