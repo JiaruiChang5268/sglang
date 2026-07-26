@@ -38,7 +38,7 @@ export PYTHONPATH=/home/hanwlax/workspace/sgl-kernel-npu/python/sgl_kernel_npu:/
 
 # dspark
 export SGLANG_RAGGED_VERIFY_MODE=static
-unset SGLANG_SIMULATE_ACC_LEN
+export  SGLANG_SIMULATE_ACC_LEN=4.0
 
 sglang serve \
     --model-path $MODEL_PATH \
