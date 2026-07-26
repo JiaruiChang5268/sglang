@@ -82,7 +82,7 @@ do
             --speculative-draft-attention-backend ascend \
             --speculative-eagle-topk 1 \
             --speculative-draft-model-quantization unquant \
-            --watchdog-timeout 9000
+            --watchdog-timeout 9000  2>&1 | tee "logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
             # --disable-cuda-graph
 
         exit 1
