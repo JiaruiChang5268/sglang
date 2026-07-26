@@ -24,7 +24,9 @@ if not is_cpu():
 if is_npu():
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-    from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+    from sglang.srt.hardware_backend.npu.kernels.kda_target_verify import (
+        kda_target_verify_npu,
+    )
 
 _KDA_USE_TORCH_NATIVE = os.getenv("SGLANG_KDA_TORCH_NATIVE_DECODE", "0") == "1"
 _KDA_USE_TORCH_NATIVE_EXTEND = os.getenv("SGLANG_KDA_TORCH_NATIVE_EXTEND", "0") == "1"

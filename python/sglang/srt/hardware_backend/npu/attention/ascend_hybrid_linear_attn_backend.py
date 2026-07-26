@@ -3,6 +3,10 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.srt.hardware_backend.npu.kernels.mamba_state_update_triton import (
+    conv_state_rollback,
+    speculative_state_scatter_npu,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -16,48 +20,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
-from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-    conv_state_rollback,
-    speculative_state_scatter_npu,
-)
-
 logger = logging.getLogger(__name__)
-
-
-def speculative_state_scatter_npu(
-    dst_cache: torch.Tensor,
-    src_cache: torch.Tensor,
-    dst_indices: torch.Tensor,
-    src_indices: torch.Tensor,
-    step_indices: torch.Tensor,
-) -> None:
-    """Commit selected speculative SSM snapshots without a large Triton tile."""
-    for i in range(step_indices.shape[0]):
-        step = int(step_indices[i].item())
-        if step < 0:
-            continue
-        dst = int(dst_indices[i].item())
-        src = int(src_indices[i].item())
-        dst_cache[:, dst].copy_(src_cache[:, src, step])
-
-
-def conv_state_rollback(
-    conv_states: torch.Tensor,
-    state_indices: torch.Tensor,
-    step_indices: torch.Tensor,
-    draft_token_num: int,
-) -> None:
-    """Match conv_state_rollback while avoiding an oversized Ascend UB tile."""
-    for i in range(step_indices.shape[0]):
-        step = int(step_indices[i].item())
-        if step < 0:
-            continue
-        shift = (draft_token_num - 1) - step
-        if shift <= 0:
-            continue
-        state_idx = int(state_indices[i].item())
-        state = conv_states[:, state_idx]
-        state[:, shift:, :].copy_(state[:, :-shift, :].clone())
 
 
 class AscendMambaAttnBackendBase(MambaAttnBackendBase):

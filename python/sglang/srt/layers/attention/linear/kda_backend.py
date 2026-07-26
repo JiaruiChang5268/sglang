@@ -24,14 +24,13 @@ from sglang.srt.utils.common import rank0_log
 # cache without casting. Use its functional implementation and write back with
 # an explicit cast in forward_decode.
 if is_npu():
+    from sglang.srt.hardware_backend.npu.kernels.causal_conv1d_verify import (
+        causal_conv1d_linear_verify_npu,
+    )
     from sgl_kernel_npu.mamba.causal_conv1d import (
         causal_conv1d_fn_npu,
         torch_causal_conv1d_update_npu,
         causal_conv1d_update_npu,
-    )
-
-    from sgl_kernel_npu.mamba.causal_conv1d_verify import (
-        causal_conv1d_linear_verify_npu,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_npu
