@@ -247,6 +247,7 @@ def causal_conv1d_linear_verify_npu(
     activation: Optional[str] = "silu",
     update_persistent_state: bool = False,
 ) -> torch.Tensor:
+    return x
     """Run fixed-width linear-chain verification and save every conv state.
 
     Shapes are ``x[B, C, T]``, ``conv_state[pool, C, W]``,
