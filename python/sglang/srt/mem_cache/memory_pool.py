@@ -1845,7 +1845,11 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
-        if not (_is_cuda or _is_hip or _is_npu):
+        # The tiled helper assumes a flat, contiguous token-major KV buffer.
+        # NPU uses a paged 4-D buffer, so filter valid rows and delegate to the
+        # page-aware set_kv_buffer path instead.
+        if not (_is_cuda or _is_hip):
+            self._debug_prefix_valid_backend = "valid_rows_set_kv_buffer"
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
@@ -1862,6 +1866,7 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        self._debug_prefix_valid_backend = "triton_tiled"
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
             cache_v,

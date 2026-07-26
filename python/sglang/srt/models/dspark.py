@@ -567,9 +567,21 @@ class DSparkDraftMixin:
                 k_mean_abs_diff = v_mean_abs_diff = float("nan")
 
             locs_host = valid_cache_locs.detach().cpu()
+            commit_lens_host = (
+                None
+                if commit_lens is None
+                else commit_lens.detach().cpu().tolist()
+            )
+            write_backend = (
+                "set_kv_buffer"
+                if write_kind == "prefill"
+                else getattr(pool, "_debug_prefix_valid_backend", "unknown")
+            )
             logger.warning(
                 "DSpark debug KV: write_kind=%s layer=%s valid_rows=%s "
-                "loc_range=[%s,%s] cache_layout=%s page_size=%s "
+                "write_backend=%s commit_lens=%s loc_range=[%s,%s] "
+                "cache_locs_sample=%s cache_layout=%s page_size=%s "
+                "k_buffer_shape=%s k_buffer_stride=%s "
                 "expected_k_shape=%s actual_k_shape=%s "
                 "expected_v_shape=%s actual_v_shape=%s "
                 "k_max_abs_diff=%.8g k_mean_abs_diff=%.8g "
@@ -577,10 +589,15 @@ class DSparkDraftMixin:
                 write_kind,
                 attn.attn.layer_id,
                 int(valid_cache_locs.numel()),
+                write_backend,
+                commit_lens_host,
                 int(locs_host.min().item()),
                 int(locs_host.max().item()),
+                locs_host[:8].tolist(),
                 cache_layout,
                 page_size,
+                tuple(actual_k_buffer.shape),
+                tuple(actual_k_buffer.stride()),
                 tuple(expected_k.shape),
                 tuple(actual_k.shape),
                 tuple(expected_v.shape),
