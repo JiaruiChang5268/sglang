@@ -35,9 +35,9 @@ export HCCL_OP_EXPANSION_MODE=AIV
 
 export PYTHONPATH=/home/hanwlax/workspace/sglang/python:$PYTHONPATH
 
-# mtp
+# dspark
 export SGLANG_RAGGED_VERIFY_MODE=static
-export SGLANG_SIMULATE_ACC_LEN=1.0
+unset SGLANG_SIMULATE_ACC_LEN
 
 sglang serve \
     --model-path $MODEL_PATH \
@@ -55,13 +55,12 @@ sglang serve \
     --chunked-prefill-size 2048 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --disable-cuda-graph \
+    --cuda-graph-max-bs-decode 8 \
     --host 0.0.0.0 \
     --port 8880 \
-    --disable-radix-cache \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
-    --speculative-dspark-block-size 1 \
+    --speculative-dspark-block-size 7 \
     --speculative-draft-attention-backend ascend \
     --speculative-eagle-topk 1 \
     --speculative-draft-model-quantization unquant \

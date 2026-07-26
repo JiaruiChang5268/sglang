@@ -988,6 +988,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             "hidden_states to capture into the graph."
                         )
                     dflash_sampler(out.hidden_states)
+                for capture_hook in self.model_runner.capture_tail_hooks:
+                    capture_hook(self, out, forward_batch, num_tokens)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)

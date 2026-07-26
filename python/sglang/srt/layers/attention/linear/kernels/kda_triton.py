@@ -155,46 +155,99 @@ def kda_target_verify_torch_native(
     cu_seqlens: torch.Tensor,
     intermediate_states_buffer: torch.Tensor,
     intermediate_state_indices: torch.Tensor,
+    cache_steps: int,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """NPU fallback for linear-chain KDA verify with rollback snapshots."""
-    out = torch.zeros_like(v)
-    seq_lens = cu_seqlens.cpu().tolist()
-    for req_idx, (start, end) in enumerate(zip(seq_lens[:-1], seq_lens[1:])):
-        cache_idx = int(initial_state_indices[req_idx].item())
-        if cache_idx < 0:
-            continue
-        scratch_idx = int(intermediate_state_indices[req_idx].item())
-        local_state = initial_state_source[cache_idx : cache_idx + 1].clone()
-        local_state_index = torch.zeros(
-            (1,),
-            dtype=initial_state_indices.dtype,
-            device=initial_state_indices.device,
+    """NPU fallback for fixed-width linear-chain KDA target verification.
+
+    Target-verify graph capture cannot perform the device-to-host copies used by
+    ``Tensor.item()`` or ``Tensor.cpu()``. DSpark static verify has a fixed
+    ``cache_steps`` tokens per request, so run the recurrence batched across
+    requests and keep only the small, shape-static token loop in Python.
+    """
+    del cu_seqlens  # Static DSpark verify is laid out as B contiguous chains.
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if q.shape[1] % cache_steps != 0:
+        raise ValueError(
+            "KDA NPU target verify expects a fixed-width layout: "
+            f"tokens={q.shape[1]}, cache_steps={cache_steps}"
         )
 
-        for local_step, token_idx in enumerate(range(start, end)):
-            token_out = kda_decode_torch_native(
-                A_log=A_log,
-                a=a[:, token_idx : token_idx + 1, ...],
-                dt_bias=dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=q[:, token_idx : token_idx + 1],
-                k=k[:, token_idx : token_idx + 1],
-                v=v[:, token_idx : token_idx + 1],
-                b=b[:, token_idx : token_idx + 1, ...],
-                initial_state_source=local_state,
-                initial_state_indices=local_state_index,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=True,
-            )
-            out[:, token_idx : token_idx + 1].copy_(token_out)
-            intermediate_states_buffer[scratch_idx, local_step].copy_(
-                local_state[0].to(intermediate_states_buffer.dtype)
-            )
+    batch_size = q.shape[1] // cache_steps
+    q_head_num = q.shape[2]
+    k_head_num = k.shape[2]
+    key_dim = q.shape[3]
+    value_head_num = v.shape[2]
+    value_dim = v.shape[3]
+    q_gqa_ratio = value_head_num // q_head_num
+    k_gqa_ratio = value_head_num // k_head_num
 
-    return out
+    q = q.squeeze(0).view(
+        batch_size, cache_steps, q_head_num, key_dim
+    )
+    k = k.squeeze(0).view(
+        batch_size, cache_steps, k_head_num, key_dim
+    )
+    v = v.squeeze(0).view(
+        batch_size, cache_steps, value_head_num, value_dim
+    )
+    a = a.reshape(batch_size, cache_steps, k_head_num, key_dim)
+    b = b.reshape(batch_size, cache_steps, value_head_num)
+
+    cache_indices = initial_state_indices[:batch_size]
+    valid_cache = cache_indices >= 0
+    safe_cache_indices = cache_indices.clamp_min(0).to(torch.int64)
+    state = initial_state_source.index_select(0, safe_cache_indices).float()
+    state = state * valid_cache.view(batch_size, 1, 1, 1)
+
+    scratch_indices = intermediate_state_indices[:batch_size].to(torch.int64)
+    dt_bias = dt_bias.float().view(1, k_head_num, key_dim)
+    A_log = A_log.float().view(1, k_head_num, 1)
+    outputs = []
+
+    for step in range(cache_steps):
+        q_step = q[:, step].float()
+        k_step = k[:, step].float()
+        q_step = q_step / (
+            q_step.norm(p=2, dim=-1, keepdim=True) + 1e-6
+        )
+        k_step = k_step / (
+            k_step.norm(p=2, dim=-1, keepdim=True) + 1e-6
+        )
+        q_step = q_step.repeat_interleave(q_gqa_ratio, dim=1) * scale
+        k_step = k_step.repeat_interleave(k_gqa_ratio, dim=1)
+
+        gate = -torch.exp(A_log) * F.softplus(
+            a[:, step].float() + dt_bias,
+            beta=1.0,
+            threshold=20.0,
+        )
+        gate = torch.exp(gate).repeat_interleave(k_gqa_ratio, dim=1)
+        beta = torch.sigmoid(b[:, step].float())
+
+        state = state * gate.unsqueeze(2)
+        value = v[:, step].float()
+        value = value - torch.matmul(
+            state, k_step.unsqueeze(-1)
+        ).squeeze(-1)
+        value = value * beta.unsqueeze(-1)
+        state = state + value.unsqueeze(-1) * k_step.unsqueeze(2)
+
+        output = torch.matmul(
+            state, q_step.unsqueeze(-1)
+        ).squeeze(-1)
+        outputs.append(output.to(v.dtype).unsqueeze(1))
+        intermediate_states_buffer[:, step].index_copy_(
+            0,
+            scratch_indices,
+            state.to(intermediate_states_buffer.dtype),
+        )
+
+    return torch.cat(outputs, dim=1).reshape(
+        1, batch_size * cache_steps, value_head_num, value_dim
+    )
 
 
 def kda_extend_torch_native(
@@ -536,6 +589,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
                 cu_seqlens=query_start_loc,
                 intermediate_states_buffer=intermediate_states_buffer,
                 intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
             )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,

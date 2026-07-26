@@ -300,6 +300,21 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
+        use_dspark_conv_snapshots = getattr(
+            self.linear_attn_backend, "_dspark_target_verify", False
+        )
+        if use_dspark_conv_snapshots:
+            intermediate_conv_window_cache = (
+                mamba_caches.intermediate_conv_window[0]
+            )
+            _move_intermediate_cache_torch(
+                conv_states,
+                intermediate_conv_window_cache,
+                dst_indices_tensor,
+                src_indices_tensor,
+                last_steps,
+            )
+
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
             mamba_track_indices = mamba_track_indices.to(torch.int64)
@@ -313,30 +328,41 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 mamba_steps_to_track,
             )
 
-            track_mask = mamba_steps_to_track >= 0
-            # Track conv state from the verify-time window before rolling back
-            # the working slot; NPU does not keep per-step conv intermediates.
-            track_indices = mamba_track_indices[track_mask]
-            if track_indices.numel() > 0:
-                conv_states[:, track_indices] = conv_states[
-                    :, dst_indices_tensor[track_mask]
-                ]
+            if use_dspark_conv_snapshots:
+                _move_intermediate_cache_torch(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    src_indices_tensor,
+                    mamba_steps_to_track,
+                )
+            else:
+                track_mask = mamba_steps_to_track >= 0
+                # Legacy NPU backends do not keep per-step conv intermediates.
+                # Preserve their verify-time window before rolling back the
+                # working slot.
+                track_indices = mamba_track_indices[track_mask]
+                if track_indices.numel() > 0:
+                    conv_states[:, track_indices] = conv_states[
+                        :, dst_indices_tensor[track_mask]
+                    ]
 
-        if dst_indices_tensor.numel() > 0:
-            _conv_state_rollback_torch(
-                conv_states,
-                dst_indices_tensor,
-                last_steps,
-                draft_token_num,
-            )
+        if not use_dspark_conv_snapshots:
+            if dst_indices_tensor.numel() > 0:
+                _conv_state_rollback_torch(
+                    conv_states,
+                    dst_indices_tensor,
+                    last_steps,
+                    draft_token_num,
+                )
 
-        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
-            _conv_state_rollback_torch(
-                conv_states,
-                mamba_track_indices,
-                mamba_steps_to_track,
-                draft_token_num,
-            )
+            if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
+                _conv_state_rollback_torch(
+                    conv_states,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                    draft_token_num,
+                )
 
         return
 
