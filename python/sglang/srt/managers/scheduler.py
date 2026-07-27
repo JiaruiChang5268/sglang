@@ -3989,13 +3989,28 @@ class Scheduler(
             ret["scale_phase"] = ElasticEPStateManager.get_scale_phase()
             ret["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
 
-        if (
-            not self.spec_algorithm.is_none()
-            and self.metrics_reporter.spec_total_num_forward_ct > 0
-        ):
-            ret["avg_spec_accept_length"] = (
+        if not self.spec_algorithm.is_none():
+            # Include the current, not-yet-logged interval so /server_info
+            # returns a complete snapshot when a benchmark has just finished.
+            spec_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_accept_tokens
-                / self.metrics_reporter.spec_total_num_forward_ct
+                + self.metrics_reporter.spec_num_accept_tokens
+            )
+            spec_num_forward_ct = (
+                self.metrics_reporter.spec_total_num_forward_ct
+                + self.metrics_reporter.spec_num_forward_ct
+            )
+            if spec_num_forward_ct > 0:
+                ret["avg_spec_accept_length"] = (
+                    spec_num_accept_tokens / spec_num_forward_ct
+                )
+
+            correct_drafts = self.metrics_reporter.spec_total_num_correct_drafts
+            proposed_drafts = self.metrics_reporter.spec_total_num_proposed_drafts
+            ret["spec_num_correct_drafts"] = correct_drafts
+            ret["spec_num_proposed_drafts"] = proposed_drafts
+            ret["avg_spec_accept_rate"] = (
+                correct_drafts / proposed_drafts if proposed_drafts > 0 else 0.0
             )
 
         if RECORD_STEP_TIME:

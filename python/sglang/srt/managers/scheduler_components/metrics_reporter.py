@@ -139,6 +139,12 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
+        # Exact lifetime acceptance-rate counters. Unlike the counters above,
+        # these are updated on every verify step instead of only when the
+        # decode log interval rolls over, so the final partial interval is not
+        # lost when /server_info is queried at the end of a benchmark.
+        self.spec_total_num_correct_drafts = 0
+        self.spec_total_num_proposed_drafts = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
@@ -364,6 +370,15 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
 
+        spec_config = self._active_spec_config_snapshot()
+        drafts_per_verify = (
+            spec_config["num_draft_tokens"] - 1
+            if spec_config["num_draft_tokens"] > 0
+            else spec_config["num_steps"]
+        )
+        self.spec_total_num_correct_drafts += int(num_correct_drafts)
+        self.spec_total_num_proposed_drafts += int(bs * drafts_per_verify)
+
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
 
@@ -522,6 +537,8 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
+        self.spec_total_num_correct_drafts = 0
+        self.spec_total_num_proposed_drafts = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
@@ -764,12 +781,11 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
-                draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
-                )
+            spec_snapshot = self._active_spec_config_snapshot()
+            if spec_snapshot["num_draft_tokens"] > 0:
+                draft_per_round = spec_snapshot["num_draft_tokens"] - 1
             else:
-                draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
+                draft_per_round = spec_snapshot["num_steps"]
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
@@ -795,7 +811,17 @@ class SchedulerMetricsReporter:
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            total_spec_accept_rate = (
+                self.spec_total_num_correct_drafts
+                / self.spec_total_num_proposed_drafts
+                if self.spec_total_num_proposed_drafts > 0
+                else 0.0
+            )
+            msg += (
+                f"accept len: {spec_accept_length:.2f}, "
+                f"accept rate: {spec_accept_rate:.2f}, "
+                f"total accept rate: {total_spec_accept_rate:.4f}, "
+            )
             if spec_cap_length > 0:
                 msg += f"cap len: {spec_cap_length:.2f}, "
             if spec_block_accept_length > 0:
@@ -808,7 +834,6 @@ class SchedulerMetricsReporter:
                         msg += f"{estimate_suffix}, "
 
             if self.current_scheduler_metrics_enabled:
-                spec_snapshot = self._active_spec_config_snapshot()
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
