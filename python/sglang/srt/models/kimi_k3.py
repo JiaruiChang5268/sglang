@@ -34,6 +34,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
+    attn_tp_reduce_scatter_tensor,
     get_attention_tp_group,
     get_local_dp_buffer,
     is_dp_attention_enabled,
@@ -332,13 +333,24 @@ class KimiMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
-                tp_rank=0,
-                tp_size=1,
                 activation_situ_beta=getattr(config, "activation_situ_beta", 1.0),
                 activation_situ_linear_beta=getattr(
                     config, "activation_situ_linear_beta", None
                 ),
             )
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the TP-sharded shared MLP while keeping MoE tokens scattered."""
+        if not (is_dp_attention_enabled() and get_parallel().attn_tp_size > 1):
+            return self.shared_experts(hidden_states)
+
+        gathered_hidden_states = get_local_dp_buffer(get_attention_tp_group())
+        attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+
+        gathered_shared_output = self.shared_experts(gathered_hidden_states)
+        shared_output = torch.empty_like(hidden_states)
+        attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+        return shared_output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
@@ -362,7 +374,7 @@ class KimiMoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            shared_output = self.shared_experts(hidden_states.clone())
+            shared_output = self._forward_shared_experts(hidden_states.clone())
 
             with torch.cuda.stream(self.alt_stream):
                 router_logits, _ = self.gate(hidden_states)
@@ -372,7 +384,7 @@ class KimiMoE(nn.Module):
             current_stream.wait_stream(self.alt_stream)
         else:
             if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
-                shared_output = self.shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(hidden_states)
             if num_tokens > 0:
                 router_logits, _ = self.gate(hidden_states)
                 topk_output = self.topk(hidden_states, router_logits)
@@ -388,10 +400,10 @@ class KimiMoE(nn.Module):
         elif self.routed_expert_hidden_size is not None:
             final_hidden_states = hidden_states.new_empty((0, hidden_size))
 
-        if self.tp_size > 1 and not is_dp_attention_enabled():
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1 and not is_dp_attention_enabled():
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
