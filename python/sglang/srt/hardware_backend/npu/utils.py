@@ -345,16 +345,21 @@ def situ_and_mul(
     return out.reshape(*x.shape[:-1], h // 2)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "N",
+        "B",
+    ]
+)
 def _apply_attn_res_kernel(
     block_residual_ptr,
     prefix_sum_ptr,
     norm_w_ptr,
     proj_w_ptr,
     out_ptr,
-    N: tl.constexpr,
+    N,
     H: tl.constexpr,
-    B: tl.constexpr,
+    B,
     EPS: tl.constexpr,
     NUM_CORES: tl.constexpr,
     NB: tl.constexpr,

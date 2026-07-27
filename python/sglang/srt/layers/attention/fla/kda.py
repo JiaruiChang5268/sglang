@@ -484,10 +484,8 @@ class FusedRMSNormGated(nn.Module):
 
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK": BK})
         for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
     ],
     key=["BC", "IS_VARLEN"],
 )
@@ -593,7 +591,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=[triton.Config({})],
     key=["BK", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -773,14 +771,12 @@ def chunk_kda_scaled_dot_kkt_fwd(
     return A, Aqk
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({})
+#     ],
+#     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+# )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
     q,
@@ -977,11 +973,9 @@ def recompute_w_u_fwd(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK": BK, "BV": BV})
         for BK in [32, 64]
         for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
     ],
     key=["BT", "IS_VARLEN"],
 )
@@ -1233,10 +1227,8 @@ def chunk_kda(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
+        triton.Config({"BT": bt})
         for bt in BT_LIST_AUTOTUNE
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
     ],
     key=["H", "D"],
 )

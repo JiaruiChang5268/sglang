@@ -190,6 +190,9 @@ def move_cache_dynamic_last_kernel_h_block(
     draft_stride,
     dst_layer_stride,
     dst_size_stride,
+    dst_h_stride,
+    dst_v_stride,
+    dst_k_stride,
     h_dim,
     dim_v,
     dim_k,
@@ -207,7 +210,6 @@ def move_cache_dynamic_last_kernel_h_block(
     if last_step_val < 0:
         return
     h_offsets = tl.arange(0, H_BLOCK_SIZE)
-    v_offsets = tl.arange(0, BLOCK_V)
     k_offsets = tl.arange(0, BLOCK_K)
 
     # Process each layer
@@ -228,20 +230,38 @@ def move_cache_dynamic_last_kernel_h_block(
         for h_start in range(0, h_dim, H_BLOCK_SIZE):
             h_real = h_start + h_offsets
             h_mask = h_real < h_dim
-
-            v_mask = v_offsets < dim_v
             k_mask = k_offsets < dim_k
 
-            mask = h_mask[:, None, None] & v_mask[None, :, None] & k_mask[None, None, :]
+            # Split the V dimension into BLOCK_V-sized chunks (e.g. 64) to keep
+            # the on-chip tile (H_BLOCK_SIZE * BLOCK_V * BLOCK_K) within budget.
+            for v_start in range(0, dim_v, BLOCK_V):
+                v_offsets = v_start + tl.arange(0, BLOCK_V)
+                v_mask = v_offsets < dim_v
 
-            linear_offset = (
-                h_real[:, None, None] * dim_v * dim_k
-                + v_offsets[None, :, None] * dim_k
-                + k_offsets[None, None, :]
-            )
+                mask = (
+                    h_mask[:, None, None]
+                    & v_mask[None, :, None]
+                    & k_mask[None, None, :]
+                )
 
-            src_block = tl.load(src_addr + linear_offset, mask=mask, other=0)
-            tl.store(dst_base_addr + linear_offset, src_block, mask=mask)
+                # src is contiguous in (H, V, K) -> flat offset.
+                src_linear_offset = (
+                    h_real[:, None, None] * dim_v * dim_k
+                    + v_offsets[None, :, None] * dim_k
+                    + k_offsets[None, None, :]
+                )
+                # dst uses its real per-element strides so a transposed
+                # (e.g. NPU transpose(-1, -2)) layout is handled correctly.
+                dst_linear_offset = (
+                    h_real[:, None, None] * dst_h_stride
+                    + v_offsets[None, :, None] * dst_v_stride
+                    + k_offsets[None, None, :] * dst_k_stride
+                )
+
+                src_block = tl.load(src_addr + src_linear_offset, mask=mask, other=0)
+                tl.store(
+                    dst_base_addr + dst_linear_offset, src_block, mask=mask
+                )
 
 
 def move_intermediate_cache(
@@ -250,7 +270,7 @@ def move_intermediate_cache(
     dst_indices_tensor,
     src_indices_tensor,
     last_steps_tensor,
-    h_block_size=2,
+    h_block_size=1,
 ):
     """
     Move intermediate cache to SSM states using Triton kernel.
@@ -271,8 +291,15 @@ def move_intermediate_cache(
         int(strides[1]),
         int(strides[2]),
     )
-    dst_layer_stride, dst_size_stride = int(ssm_states.stride()[0]), int(
-        ssm_states.stride()[1]
+    dst_strides = ssm_states.stride()
+    dst_layer_stride, dst_size_stride = int(dst_strides[0]), int(dst_strides[1])
+    # Per-element strides for the trailing (H, V, K) dims. On NPU the temporal
+    # state is transposed (-1, -2), so the dst layout differs from the src and
+    # must be indexed through its real strides instead of a flat (V*K, K, 1).
+    dst_h_stride, dst_v_stride, dst_k_stride = (
+        int(dst_strides[2]),
+        int(dst_strides[3]),
+        int(dst_strides[4]),
     )
     assert len(dst_indices_tensor) == len(
         last_steps_tensor
@@ -295,12 +322,15 @@ def move_intermediate_cache(
         draft_stride=draft_stride,
         dst_layer_stride=dst_layer_stride,
         dst_size_stride=dst_size_stride,
+        dst_h_stride=dst_h_stride,
+        dst_v_stride=dst_v_stride,
+        dst_k_stride=dst_k_stride,
         h_dim=H,
         dim_v=V,
         dim_k=K,
         num_layers=L,
         H_BLOCK_SIZE=h_block_size,  # Process 2 h elements per block
-        BLOCK_V=triton.next_power_of_2(V),  # Block size for dim_v
+        BLOCK_V=64,  # Split dim_v into 64-wide chunks to fit on-chip memory
         BLOCK_K=triton.next_power_of_2(K),  # Block size for dim_k
     )
 
@@ -485,3 +515,91 @@ def conv_state_rollback(
     )
 
     return conv_states
+
+
+
+device="npu"
+import random
+@torch.no_grad
+def test_move_intermediate_cache(
+    L: int,
+    S: int,
+    D: int,
+    H: int,
+    V: int,
+    K: int,
+    num_valid: int,
+    dtype: torch.dtype,
+    dst_transposed: bool = False,
+):
+    """Verify move_intermediate_cache and speculative_state_scatter_npu.
+
+    Args:
+        dst_transposed: If True, allocate dst contiguous then apply
+            ``transpose(-1, -2)`` to mimic the NPU temporal_state layout
+            (memory_pool.py does this for ``_is_npu``). This makes dst
+            non-contiguous in (H, V, K) and is the case that exposed the
+            ``move_intermediate_cache`` precision bug.
+    """
+    torch.manual_seed(42)
+    # prepare input data
+    dst_cache = torch.randn(L, S, H, V, K, device=device, dtype=dtype)
+    if dst_transposed:
+        dst_cache = dst_cache.transpose(-1, -2)  # logical (L, S, H, K, V)
+    dst_cache_clone = dst_cache.clone()
+    src_cache = torch.randn(L, S, D, H, V, K, device=device, dtype=dtype)
+
+    # prepare input data
+    population = range(S)
+    valid_indices = random.sample(population, num_valid)
+    last_step_pos = [random.randint(0, D - 1) for _ in range(num_valid)]
+    dst_indices_tensor = torch.tensor(valid_indices, device=device, dtype=torch.int32)
+    src_indices_tensor = torch.arange(
+        dst_indices_tensor.shape[0], device=device, dtype=torch.int32
+    )
+    last_steps_tensor = torch.tensor(last_step_pos, device=device, dtype=torch.int32)
+
+    valid_mask = last_steps_tensor >= 0
+    dst_state_indices = dst_indices_tensor[valid_mask].to(torch.int64)
+    src_state_indices = src_indices_tensor[valid_mask].to(torch.int64)
+    valid_last_steps = last_steps_tensor[valid_mask].to(torch.int64)
+    # prepare output verify (PyTorch ground truth, layout-agnostic)
+    dst_cache[:, dst_state_indices, :] = src_cache[
+        :, src_state_indices, valid_last_steps
+    ]
+
+    # Verify move_intermediate_cache against the reference on an isolated clone
+    dst_move = dst_cache_clone.clone()
+    move_intermediate_cache(
+        dst_move,
+        src_cache,
+        dst_indices_tensor,
+        src_indices_tensor,
+        last_steps_tensor,
+    )
+    torch.testing.assert_close(dst_cache, dst_move, atol=1e-3, rtol=1e-3)
+
+    # Verify speculative_state_scatter_npu against the reference on an isolated clone
+    dst_scatter = dst_cache_clone.clone()
+    speculative_state_scatter_npu(
+        dst_scatter,
+        src_cache,
+        dst_indices_tensor,
+        src_indices_tensor,
+        last_steps_tensor,
+    )
+    torch.testing.assert_close(dst_cache, dst_scatter, atol=1e-3, rtol=1e-3)
+
+
+
+# "69,17,8,6,128,128;1;1;1"
+if __name__ == "__main__":
+    # Contiguous dst layout (non-NPU): both kernels must pass.
+    test_move_intermediate_cache(69, 17, 8, 6, 128, 128, 17, torch.bfloat16)
+    # NPU transposed dst layout: reproduces the move_intermediate_cache bug
+    # where dst stride was hard-coded as (V*K, K, 1) instead of read from the
+    # transposed tensor.
+    test_move_intermediate_cache(
+        69, 17, 8, 6, 128, 128, 17, torch.bfloat16, dst_transposed=True
+    )
+    

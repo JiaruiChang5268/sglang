@@ -6,6 +6,7 @@ import torch
 from sglang.srt.hardware_backend.npu.kernels.mamba_state_update_triton import (
     conv_state_rollback,
     speculative_state_scatter_npu,
+    move_intermediate_cache,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -259,7 +260,14 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int32)  # [N]
 
-        speculative_state_scatter_npu(
+        # speculative_state_scatter_npu(
+        #     ssm_states,
+        #     intermediate_state_cache,
+        #     dst_indices_tensor,
+        #     src_indices_tensor,
+        #     last_steps,
+        # )
+        move_intermediate_cache(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
@@ -288,12 +296,19 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             mamba_track_indices = mamba_track_indices.to(torch.int64)
             mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
 
-            speculative_state_scatter_npu(
+            # speculative_state_scatter_npu(
+            #     ssm_states,
+            #     intermediate_state_cache,
+            #     mamba_track_indices,
+            #     src_indices_tensor,
+            #     mamba_steps_to_track,
+            # )
+            move_intermediate_cache(
                 ssm_states,
                 intermediate_state_cache,
-                mamba_track_indices,
+                dst_indices_tensor,
                 src_indices_tensor,
-                mamba_steps_to_track,
+                last_steps,
             )
 
             if use_dspark_conv_snapshots:
