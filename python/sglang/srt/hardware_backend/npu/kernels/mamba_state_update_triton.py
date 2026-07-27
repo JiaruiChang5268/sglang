@@ -39,39 +39,52 @@ def _speculative_state_scatter_kernel(
     TAIL_DIM_1: tl.constexpr,
     TAIL_DIM_2: tl.constexpr,
     BLOCK: tl.constexpr,
+    GRID: tl.constexpr,
+    GRID_Y: tl.constexpr,
+    GRID_Z: tl.constexpr,
+    GRID_BLOCK: tl.constexpr
 ):
-    pid_req = tl.program_id(0)
-    pid_layer = tl.program_id(1)
-    pid_tail = tl.program_id(2)
+    pid = tl.program_id(0)
+    for iii in range(pid, GRID, GRID_BLOCK):
+        tmp0 = iii
+        pid_tail = tmp0 % GRID_Z
+        tmp0 //= GRID_Z
+        pid_layer = tmp0 % GRID_Y
+        tmp0 //= GRID_Y
+        pid_req = tmp0
 
-    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
-    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
-    step_idx = tl.load(step_indices_ptr + pid_req).to(tl.int64)
-    offsets = pid_tail * BLOCK + tl.arange(0, BLOCK)
-    valid = (dst_idx >= 0) & (src_idx >= 0) & (step_idx >= 0)
-    mask = valid & (offsets < tail_numel)
-    tail_0 = offsets // (TAIL_DIM_1 * TAIL_DIM_2)
-    tail_rem = offsets % (TAIL_DIM_1 * TAIL_DIM_2)
-    tail_1 = tail_rem // TAIL_DIM_2
-    tail_2 = tail_rem % TAIL_DIM_2
+        # pid_req = tl.program_id(0)
+        # pid_layer = tl.program_id(1)
+        # pid_tail = tl.program_id(2)
 
-    src_offsets = (
-        pid_layer * src_layer_stride
-        + src_idx * src_slot_stride
-        + step_idx * src_step_stride
-        + tail_0 * src_tail_stride_0
-        + tail_1 * src_tail_stride_1
-        + tail_2 * src_tail_stride_2
-    )
-    dst_offsets = (
-        pid_layer * dst_layer_stride
-        + dst_idx * dst_slot_stride
-        + tail_0 * dst_tail_stride_0
-        + tail_1 * dst_tail_stride_1
-        + tail_2 * dst_tail_stride_2
-    )
-    values = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
-    tl.store(dst_ptr + dst_offsets, values, mask=mask)
+        dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+        src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+        step_idx = tl.load(step_indices_ptr + pid_req).to(tl.int64)
+        offsets = pid_tail * BLOCK + tl.arange(0, BLOCK)
+        valid = (dst_idx >= 0) & (src_idx >= 0) & (step_idx >= 0)
+        mask = valid & (offsets < tail_numel)
+        tail_0 = offsets // (TAIL_DIM_1 * TAIL_DIM_2)
+        tail_rem = offsets % (TAIL_DIM_1 * TAIL_DIM_2)
+        tail_1 = tail_rem // TAIL_DIM_2
+        tail_2 = tail_rem % TAIL_DIM_2
+
+        src_offsets = (
+            pid_layer * src_layer_stride
+            + src_idx * src_slot_stride
+            + step_idx * src_step_stride
+            + tail_0 * src_tail_stride_0
+            + tail_1 * src_tail_stride_1
+            + tail_2 * src_tail_stride_2
+        )
+        dst_offsets = (
+            pid_layer * dst_layer_stride
+            + dst_idx * dst_slot_stride
+            + tail_0 * dst_tail_stride_0
+            + tail_1 * dst_tail_stride_1
+            + tail_2 * dst_tail_stride_2
+        )
+        values = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
+        tl.store(dst_ptr + dst_offsets, values, mask=mask)
 
 
 def speculative_state_scatter_npu(
@@ -133,8 +146,14 @@ def speculative_state_scatter_npu(
     dst_tail_strides = (0,) * (3 - len(tail_shape)) + dst.stride()[2:]
     src_tail_strides = (0,) * (3 - len(tail_shape)) + src.stride()[3:]
     block = min(1024, triton.next_power_of_2(tail_numel))
-    grid = (num_requests, dst.shape[0], triton.cdiv(tail_numel, block))
-    _speculative_state_scatter_kernel[grid](
+    # grid = (num_requests, dst.shape[0], triton.cdiv(tail_numel, block))
+    
+    grid_x = num_requests
+    grid_y = dst.shape[0]
+    grid_z = triton.cdiv(tail_numel, block)
+    total_grid = grid_x * grid_y * grid_z
+    launch_grid = 48
+    _speculative_state_scatter_kernel[(launch_grid,)](
         dst,
         src,
         dst_indices,
@@ -151,6 +170,10 @@ def speculative_state_scatter_npu(
         TAIL_DIM_1=padded_tail_shape[1],
         TAIL_DIM_2=padded_tail_shape[2],
         BLOCK=block,
+        GRID=total_grid,
+        GRID_Y=grid_y,
+        GRID_Z=grid_z,
+        GRID_BLOCK=launch_grid
     )
     return dst
 
