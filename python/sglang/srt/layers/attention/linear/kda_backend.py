@@ -552,7 +552,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if is_npu():
             qkv = causal_conv1d_update(
                 mixed_qkv,
-                conv_states,
+                conv_states.to(torch.float32),
                 layer.conv_weights,
                 layer.bias,
                 activation="silu",
