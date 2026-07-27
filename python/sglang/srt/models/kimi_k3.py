@@ -1114,9 +1114,26 @@ class KimiLinearModel(nn.Module):
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual)
+                captured_hidden = self._dspark_capture_stream(
+                    i, hidden_states, residual
                 )
+                if is_dp_attention_enabled() and get_parallel().attn_tp_size > 1:
+                    attn_tp_size = get_parallel().attn_tp_size
+                    expected_num_tokens = captured_hidden.shape[0] * attn_tp_size
+                    if expected_num_tokens != forward_batch.input_ids.shape[0]:
+                        raise ValueError(
+                            "DSpark aux hidden token mismatch before attention-TP "
+                            f"allgather: local={captured_hidden.shape[0]}, "
+                            f"attn_tp_size={attn_tp_size}, "
+                            f"expected_full={expected_num_tokens}, "
+                            f"forward_tokens={forward_batch.input_ids.shape[0]}"
+                        )
+                    gathered_hidden = captured_hidden.new_empty(
+                        (expected_num_tokens, *captured_hidden.shape[1:])
+                    )
+                    attn_tp_all_gather_into_tensor(gathered_hidden, captured_hidden)
+                    captured_hidden = gathered_hidden
+                aux_hidden_states.append(captured_hidden)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
