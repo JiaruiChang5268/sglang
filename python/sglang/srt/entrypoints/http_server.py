@@ -765,6 +765,32 @@ async def server_info():
     )
 
 
+@app.get("/spec_acceptance")
+async def spec_acceptance():
+    """Return cumulative speculative-decoding acceptance counters.
+
+    Scheduler states are reported once per DP rank. Aggregate the raw
+    numerator and denominator here so clients do not need to download or
+    interpret the full /server_info response.
+    """
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
+    correct_drafts = sum(
+        int(state.get("spec_num_correct_drafts", 0)) for state in internal_states
+    )
+    proposed_drafts = sum(
+        int(state.get("spec_num_proposed_drafts", 0)) for state in internal_states
+    )
+    return {
+        "spec_num_correct_drafts": correct_drafts,
+        "spec_num_proposed_drafts": proposed_drafts,
+        "avg_spec_accept_rate": (
+            correct_drafts / proposed_drafts if proposed_drafts > 0 else 0.0
+        ),
+    }
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).
