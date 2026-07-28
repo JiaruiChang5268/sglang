@@ -210,6 +210,9 @@ if _is_cuda:
     )
     from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
+    from sglang.srt.hardware_backend.npu.dsv4.swiglu_clamp import (
+        npu_swiglu_clamp,
+    )
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -407,15 +410,10 @@ class DeepseekV2MLP(nn.Module):
                     activation="silu",
                 )
 
-        # Fallback: use the fused clamp+SwiGLU kernel where available. On NPU,
-        # clamp the projection output in place to avoid a concat allocation/copy.
+        # Fallback: use the fused clamp+SwiGLU kernel where available.
         elif self.swiglu_limit is not None:
             if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                _g.clamp_(max=_lim)
-                _u.clamp_(min=-_lim, max=_lim)
-                x = self.act_fn(gate_up)
+                x = npu_swiglu_clamp(gate_up, float(self.swiglu_limit))
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
@@ -438,11 +436,9 @@ class DeepseekV2MLP(nn.Module):
         """Finish the NPU shared expert after its gate/up projection."""
         assert _is_npu
         if self.swiglu_limit is not None:
-            gate, up = gate_up.chunk(2, dim=-1)
-            limit = float(self.swiglu_limit)
-            gate.clamp_(max=limit)
-            up.clamp_(min=-limit, max=limit)
-        x = self.act_fn(gate_up)
+            x = npu_swiglu_clamp(gate_up, float(self.swiglu_limit))
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, skip_all_reduce=False)
         return x
 
