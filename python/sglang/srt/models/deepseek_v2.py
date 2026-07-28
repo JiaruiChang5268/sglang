@@ -428,6 +428,25 @@ class DeepseekV2MLP(nn.Module):
         )
         return x
 
+    def forward_npu_gate_up(self, x):
+        """Run the shared-expert gate/up projection on the NPU alt stream."""
+        assert _is_npu
+        gate_up, _ = self.gate_up_proj(x)
+        return gate_up
+
+    def forward_npu_after_gate_up(self, gate_up):
+        """Finish the NPU shared expert after its gate/up projection."""
+        assert _is_npu
+        if self.swiglu_limit is not None:
+            gate, up = gate_up.chunk(2, dim=-1)
+            limit = float(self.swiglu_limit)
+            gate_up = torch.cat(
+                [gate.clamp(max=limit), up.clamp(min=-limit, max=limit)], dim=-1
+            )
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x, skip_all_reduce=False)
+        return x
+
 
 class MoEGate(nn.Module):
     def __init__(
@@ -850,9 +869,7 @@ class DeepseekV2MoE(nn.Module):
         # DP attention may publish a global mode so every rank makes the same
         # decision even when an individual rank is idle. MIXED is deliberately
         # excluded because it also contains decode-token rows.
-        forward_mode = (
-            forward_batch.global_forward_mode or forward_batch.forward_mode
-        )
+        forward_mode = forward_batch.global_forward_mode or forward_batch.forward_mode
         return {
             "force_balanced_topk": forward_mode
             in (
@@ -991,9 +1008,7 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
-            )
+            topk_kwargs.update(self._npu_prefill_balanced_topk_kwargs(forward_batch))
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1095,9 +1110,7 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
-            )
+            topk_kwargs.update(self._npu_prefill_balanced_topk_kwargs(forward_batch))
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1246,14 +1259,15 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_gate_up = None
+        shared_event = None
         is_dsv4_npu_multistream = (
-            self.is_deepseek_v4
+            getattr(self, "is_deepseek_v4", False)
             and _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
         )
         use_alt_stream = self.alt_stream is not None and (
-            not is_dsv4_npu_multistream
-            or forward_batch.forward_mode.is_cuda_graph()
+            not is_dsv4_npu_multistream or forward_batch.forward_mode.is_cuda_graph()
         )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -1261,6 +1275,14 @@ class DeepseekV2MoE(nn.Module):
         )
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+        )
+        split_shared_expert_overlap = (
+            is_dsv4_npu_multistream
+            and use_alt_stream
+            and envs.SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP.get()
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+            and hidden_states.shape[0] > 0
         )
 
         if hidden_states.shape[0] > 0:
@@ -1271,9 +1293,18 @@ class DeepseekV2MoE(nn.Module):
                     device_module = torch.get_device_module(hidden_states.device)
                     self.alt_stream.wait_stream(device_module.current_stream())
                     with device_module.stream(self.alt_stream):
-                        shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
+                        if split_shared_expert_overlap:
+                            # Gate/up is a QuantMatmul. Launch it while DeepEP
+                            # dispatch is in flight, but keep activation/down out
+                            # of the routed GroupedMatmul resource window.
+                            shared_gate_up = self.shared_experts.forward_npu_gate_up(
+                                hidden_states
+                            )
+                            shared_gate_up.record_stream(self.alt_stream)
+                        else:
+                            shared_output = self._forward_shared_experts(hidden_states)
+                            shared_output.record_stream(self.alt_stream)
+                            shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1281,9 +1312,7 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_kwargs.update(
-                self._npu_prefill_balanced_topk_kwargs(forward_batch)
-            )
+            topk_kwargs.update(self._npu_prefill_balanced_topk_kwargs(forward_batch))
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1399,6 +1428,34 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif split_shared_expert_overlap:
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                nonlocal shared_output, shared_event
+
+                assert shared_gate_up is not None
+                assert self.alt_stream is not None
+                # The main stream has enqueued routed GroupedMatmul by this
+                # point. Make the alt stream wait for it, then launch shared
+                # activation/down concurrently with DeepEP Combine.
+                device_module = torch.get_device_module(hidden_states.device)
+                routed_experts_done = device_module.current_stream().record_event()
+                self.alt_stream.wait_event(routed_experts_done)
+                with device_module.stream(self.alt_stream):
+                    shared_output = self.shared_experts.forward_npu_after_gate_up(
+                        shared_gate_up
+                    )
+                    shared_output.record_stream(self.alt_stream)
+                    shared_event = self.alt_stream.record_event()
+
+                pre_combine_hook_handle.remove()
+
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+
         elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
             # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
 
@@ -1458,6 +1515,7 @@ class DeepseekV2MoE(nn.Module):
             and use_alt_stream
         ):
             device_module = torch.get_device_module(hidden_states.device)
+            assert shared_event is not None
             device_module.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
@@ -1514,9 +1572,7 @@ class DeepseekV2MoE(nn.Module):
         topk_kwargs = {}
         if getattr(self, "is_hash", False):
             topk_kwargs["input_ids"] = state.forward_batch.input_ids
-        topk_kwargs.update(
-            self._npu_prefill_balanced_topk_kwargs(state.forward_batch)
-        )
+        topk_kwargs.update(self._npu_prefill_balanced_topk_kwargs(state.forward_batch))
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
