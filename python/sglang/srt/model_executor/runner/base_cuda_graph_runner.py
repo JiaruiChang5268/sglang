@@ -73,7 +73,9 @@ def get_batch_sizes_to_capture(
         mul_base *= 2
         num_tokens_per_bs = 1
 
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer(server_args) and not is_dp_local_cuda_graph_capture(
+        model_runner
+    ):
         mul_base *= get_parallel().attn_tp_size
 
     if mul_base % get_parallel().attn_cp_size != 0:
@@ -98,6 +100,20 @@ def get_batch_sizes_to_capture(
         else []
     )
     return capture_bs, compile_bs
+
+def is_dp_local_cuda_graph_capture(model_runner: ModelRunner) -> bool:
+    """Whether decode graphs are keyed by per-DP-rank local batch size."""
+    if not getattr(model_runner, "is_draft_worker", False):
+        return False
+    spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+    if spec_algorithm is None or not spec_algorithm.is_dspark():
+        return False
+
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_is_deepseek_v4,
+    )
+
+    return not draft_is_deepseek_v4(server_args=model_runner.server_args)
 
 
 class BaseCudaGraphRunner(BaseRunner):

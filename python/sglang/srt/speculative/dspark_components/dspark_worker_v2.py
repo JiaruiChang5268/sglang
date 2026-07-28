@@ -318,8 +318,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        # capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
-        capture_decode_cuda_graph = False
+        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
 
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)

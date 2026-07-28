@@ -71,6 +71,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
     get_batch_sizes_to_capture,
+    is_dp_local_cuda_graph_capture,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
@@ -459,15 +460,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         DP rank drafts independently with no cross-DP collective, so its
         hand-built batches carry no dp-global metadata and must key graphs by
         local batch size. Everything else keeps the dp-global padding path."""
-        if not model_runner.is_draft_worker:
-            return False
-        if not model_runner.spec_algorithm.is_dspark():
-            return False
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
-        )
-
-        return not draft_is_deepseek_v4(server_args=model_runner.server_args)
+        return is_dp_local_cuda_graph_capture(model_runner)
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
