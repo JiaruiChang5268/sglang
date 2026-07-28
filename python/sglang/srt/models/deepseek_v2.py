@@ -407,14 +407,14 @@ class DeepseekV2MLP(nn.Module):
                     activation="silu",
                 )
 
-        # Fallback: fused silu+clamp kernel (still faster than unfused)
+        # Fallback: use the fused clamp+SwiGLU kernel where available. On NPU,
+        # clamp the projection output in place to avoid a concat allocation/copy.
         elif self.swiglu_limit is not None:
             if _is_npu:
                 _g, _u = gate_up.chunk(2, dim=-1)
                 _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-                )
+                _g.clamp_(max=_lim)
+                _u.clamp_(min=-_lim, max=_lim)
                 x = self.act_fn(gate_up)
             else:
                 M, N = gate_up.shape
@@ -440,9 +440,8 @@ class DeepseekV2MLP(nn.Module):
         if self.swiglu_limit is not None:
             gate, up = gate_up.chunk(2, dim=-1)
             limit = float(self.swiglu_limit)
-            gate_up = torch.cat(
-                [gate.clamp(max=limit), up.clamp(min=-limit, max=limit)], dim=-1
-            )
+            gate.clamp_(max=limit)
+            up.clamp_(min=-limit, max=limit)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, skip_all_reduce=False)
         return x
