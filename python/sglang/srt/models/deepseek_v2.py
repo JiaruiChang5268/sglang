@@ -223,6 +223,9 @@ if _is_cuda:
         dsv3_router_gemm as dsv3_router_gemm,
     )
 elif _is_npu:
+    from sglang.srt.hardware_backend.npu.dsv4.swiglu_clamp import (
+        npu_swiglu_clamp,
+    )
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -423,12 +426,7 @@ class DeepseekV2MLP(nn.Module):
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
             if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-                )
-                x = self.act_fn(gate_up)
+                x = npu_swiglu_clamp(gate_up, float(self.swiglu_limit))
             else:
                 M, N = gate_up.shape
                 x = gate_up.new_empty((M, N // 2))
