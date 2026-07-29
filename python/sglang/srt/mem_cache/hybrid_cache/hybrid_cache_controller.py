@@ -646,24 +646,113 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+        kv_complete = not operation.is_terminated() and kv_completed_pages == len(
+            operation.hash_value
+        )
+        if operation.pool_transfers and not kv_complete:
+            logger.error(
+                "Hybrid HiCache KV prefetch is incomplete; rejecting the entire "
+                "composite entry (completed_pages=%s, expected_pages=%s, pools=%s)",
+                kv_completed_pages,
+                len(operation.hash_value),
+                [transfer.name for transfer in operation.pool_transfers],
+            )
+            operation.completed_tokens = 0
+            operation.pool_storage_result.kv_hit_pages = 0
+            operation.mark_terminate()
+
+        if operation.pool_transfers and kv_complete:
             self._sync_trailing_keys(
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            if not self._are_pool_results_complete(operation.pool_transfers, results):
+                logger.error(
+                    "Hybrid HiCache storage prefetch is incomplete; rejecting the "
+                    "entire composite entry (completed_kv_tokens=%s, pools=%s)",
+                    operation.completed_tokens,
+                    [transfer.name for transfer in operation.pool_transfers],
+                )
+                operation.completed_tokens = 0
+                operation.pool_storage_result.kv_hit_pages = 0
+                operation.mark_terminate()
         operation.pool_transfers_done = True
 
+    def _are_pool_results_complete(
+        self, transfers: list[PoolTransfer], results: dict
+    ) -> bool:
+        for transfer in transfers:
+            result = results.get(transfer.name)
+            if result is None:
+                result = results.get(transfer.name.value)
+            expected = len(transfer.keys or [])
+            if expected == 0 and transfer.host_indices is not None:
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                page_size = getattr(
+                    getattr(entry, "host_pool", None), "page_size", self.page_size
+                )
+                expected = int(transfer.host_indices.numel()) // page_size
+            if (
+                not isinstance(result, (list, tuple))
+                or len(result) != expected
+                or not all(bool(ok) for ok in result)
+            ):
+                return False
+        return True
+
     def _page_backup(self, operation):
-        # Backup extra pools
-        if operation.pool_transfers:
+        # MLA KV is replicated across TP ranks and should still be written only
+        # by TP0. On follower ranks, only the rank-sharded Mamba/KDA pool is
+        # owned by the rank and must be written here. Do not replicate other
+        # sidecar pools (for example SWA or indexer state) accidentally.
+        backup_transfers = operation.pool_transfers
+        if self.backup_skip:
+            backup_transfers = [
+                transfer
+                for transfer in operation.pool_transfers or []
+                if transfer.name == PoolName.MAMBA
+            ]
+
+        sidecar_ok = not bool(backup_transfers)
+        if backup_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            sidecar_ok = self._are_pool_results_complete(backup_transfers, results)
 
-        # Backup kv pools
-        super()._page_backup(operation)
+        if not self.backup_skip:
+            super()._page_backup(operation)
+            kv_ok = (
+                operation.completed_tokens == len(operation.hash_value) * self.page_size
+            )
+            if backup_transfers and not (kv_ok and sidecar_ok):
+                # The KV objects may already exist, but batch_exists_v2 gates
+                # visibility on every sidecar component. Report this operation
+                # as failed so PrefixCache never marks an incomplete Kimi entry.
+                operation.completed_tokens = 0
+        else:
+            operation.completed_tokens = (
+                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+            )
+
+    def backup_thread_func(self):
+        """Back up rank-sharded sidecars on every TP rank.
+
+        The base implementation skips the entire operation on non-zero MLA TP
+        ranks. That optimization is valid for replicated MLA KV, but not for
+        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
+        """
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
+            except Empty:
+                continue
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

@@ -38,6 +38,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_allocator_type(server_args: ServerArgs) -> str:
+    return get_allocator_type(server_args)
+
+
+def _resolve_mamba_host_layout(layout: str) -> str:
+    """Resolve the recurrent-state sidecar layout independently of MLA KV.
+
+    Ascend MLA uses a split K/V host layout, while Mamba/KDA stores temporal
+    and convolution state tensors.  Reusing ``page_first_kv_split`` for that
+    sidecar is both semantically wrong and rejected by ``MambaPoolHost``.
+    """
+    resolved = "page_first_direct" if layout == "page_first_kv_split" else layout
+    logger.info(
+        "Resolved hybrid HiCache host layouts: anchor=%s, Mamba/KDA=%s",
+        layout,
+        resolved,
+    )
+    return resolved
+
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -525,8 +546,8 @@ def build_hybrid_mamba_stack(
         mamba_pool,
         server_args.hicache_ratio,
         server_args.hicache_size,
-        allocator_type=server_args.hicache_storage_backend,
-        layout=mamba_layout,
+        allocator_type=_get_allocator_type(server_args),
+        layout=_resolve_mamba_host_layout(server_args.hicache_mem_layout),
     )
     entries = [
         build_pool_entry(
@@ -536,6 +557,110 @@ def build_hybrid_mamba_stack(
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.MAMBA,
+            host_pool=mamba_host_pool,
+            device_pool=mamba_pool,
+            layer_mapping=mamba_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            host_evict_fn=host_mamba_evict_fn,
+            device_evict_fn=device_mamba_evict_fn,
+            device_alloc_fn=mamba_allocator.alloc,
+            device_free_fn=mamba_allocator.free,
+        ),
+    ]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        page_size,
+        tp_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
+        pp_group=pp_group,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def build_hybrid_mamba_swa_stack(
+    *,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    mamba_pool: Any,
+    full_layer_mapping: dict[int, int],
+    swa_layer_mapping: dict[int, int],
+    mamba_layer_mapping: dict[int, int],
+    page_size: int,
+    tp_group,
+    load_cache_event,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    storage_backend: Optional[str],
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    transfer_layer_num = len(
+        full_layer_mapping | swa_layer_mapping | mamba_layer_mapping
+    )
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=full_kv_pool,
+        page_size=page_size,
+        server_args=server_args,
+        use_mla=False,
+    )
+    swa_host_pool = build_kv_host_pool(
+        kv_pool=swa_kv_pool,
+        page_size=page_size,
+        server_args=server_args,
+        use_mla=False,
+    )
+    mamba_host_pool = MambaPoolHost(
+        mamba_pool,
+        server_args.hicache_ratio,
+        server_args.hicache_size,
+        allocator_type=server_args.hicache_storage_backend,
+        layout=_resolve_mamba_host_layout(server_args.hicache_mem_layout),
+    )
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host_pool,
+            device_pool=full_kv_pool,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=swa_host_pool,
+            device_pool=swa_kv_pool,
+            layer_mapping=swa_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            host_evict_fn=host_swa_evict_fn,
+            device_evict_fn=device_swa_evict_fn,
+            device_alloc_fn=swa_attn_allocator.alloc,
+            device_free_fn=swa_attn_allocator.free,
         ),
         build_pool_entry(
             name=PoolName.MAMBA,

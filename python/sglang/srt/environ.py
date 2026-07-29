@@ -497,6 +497,10 @@ class Envs:
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
     SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
+    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
+
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)

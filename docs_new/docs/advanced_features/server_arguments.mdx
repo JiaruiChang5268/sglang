@@ -2048,9 +2048,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The storage backend for hierarchical KV cache. Built-in backends include file, mooncake, ascend_memcache, hf3fs, nixl, and aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>file</code>, <code>mooncake</code>, <code>hf3fs</code>, <code>nixl</code>, <code>aibrix</code>, <code>dynamic</code>, <code>eic</code>, <code>simm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>file</code>, <code>mooncake</code>, <code>ascend_memcache</code>, <code>hf3fs</code>, <code>nixl</code>, <code>aibrix</code>, <code>dynamic</code>, <code>eic</code>, <code>simm</code>, <code>mori</code>, <code>shm</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-prefetch-policy`</td>

@@ -2281,6 +2281,791 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
+    # Mamba cache and linear attn
+    # -------------------------------------------------------------------------
+    max_mamba_cache_size: A[
+        Optional[int], "The maximum size of the mamba cache.", NS("schedule")
+    ] = None
+    mamba_ssm_dtype: A[
+        Optional[str],
+        Arg(
+            help="The data type of the SSM states in mamba cache. If not set, will be read from model config (mamba_ssm_dtype).",
+            choices=["float32", "bfloat16", "float16"],
+        ),
+        NS("exec.mamba"),
+    ] = None
+    mamba_max_states_per_path: A[
+        int,
+        "Maximum number of cached Mamba states retained per root-to-tail path "
+        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
+        "interior states beyond the cap are removed while their full KV remains. "
+        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+        NS("exec.mamba"),
+    ] = -1
+    enable_mamba_cache_stochastic_rounding: A[
+        bool,
+        "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
+        NS("exec.mamba"),
+    ] = False
+    mamba_cache_philox_rounds: A[
+        int,
+        "Number of Philox rounds to use for stochastic rounding of FP16 Mamba SSM cache writes. Triton uses the Triton default when set to 0; FlashInfer uses 10 rounds when set to 0.",
+        NS("exec.mamba"),
+    ] = 0
+    mamba_full_memory_ratio: A[
+        float,
+        Arg(
+            help="The ratio of mamba state memory to full kv cache memory.",
+            resolvable=True,
+        ),
+        NS("schedule"),
+    ] = 0.9
+    mamba_radix_cache_strategy: A[
+        str,
+        Arg(
+            help="The strategy to use for mamba radix cache.",
+            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            resolvable=True,
+        ),
+        NS("exec.mamba"),
+    ] = "auto"
+    uses_mamba_radix_cache: A[
+        bool,
+        Arg(
+            help="(Derived) whether the model routes through the hybrid-mamba "
+            "radix cache handling; resolved from the model architecture, no "
+            "CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+        NS("exec.mamba"),
+    ] = False
+    mamba_track_interval: A[
+        int, "The interval to track the mamba state during decode.", NS("exec.mamba")
+    ] = 256
+    enable_int8_mamba_checkpoint: A[
+        bool,
+        "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        NS("exec.mamba"),
+    ] = False
+    int8_mamba_ckpt_size: A[
+        Optional[int],
+        "Number of int8 mamba checkpoint slots (default: 2x the active mamba pool size).",
+        NS("exec.mamba"),
+    ] = None
+    linear_attn_backend: A[
+        str,
+        Arg(
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+        NS("exec.mamba"),
+    ] = "triton"
+    linear_attn_decode_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+        NS("exec.mamba"),
+    ] = None
+    linear_attn_prefill_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+        ),
+        NS("exec.mamba"),
+    ] = None
+    linear_attn_verify_backend: A[
+        Optional[str],
+        Arg(
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+        ),
+    ] = None
+    # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
+    # ring + periodic flush to cut per-step HBM state traffic.
+    enable_linear_replayssm: A[
+        bool,
+        "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
+        "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
+        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
+        "is numerically correct, but KDA decode is SLOWER than the packed "
+        "baseline (the per-K g_cache is K x larger and the reconstruction "
+        "refolds the per-K decay every step), so it is not recommended for KDA "
+        "models. Requires the Triton linear-attn decode backend and "
+        "--mamba-radix-cache-strategy no_buffer (the default).",
+        NS("exec.mamba"),
+    ] = False
+    linear_replayssm_cache_len: A[
+        int,
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+        NS("exec.mamba"),
+    ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via a
+    # per-slot ring + periodic flush instead of per-draft full-state snapshots.
+    # Linear-chain (topk <= 1) only. GDN uses a (d, k, g) circular ring + cursors;
+    # KDA folds a (raw v, pre-norm k, gate, beta) ring into the fp32 checkpoint
+    # every commit. Ring length reuses `linear_replayssm_cache_len`.
+    enable_linear_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM linear-attn spec-verify kernel (Part B of RFC #28511): a per-slot ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN or KDA, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+        NS("exec.mamba"),
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Hierarchical cache
+    # -------------------------------------------------------------------------
+    enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
+        False
+    )
+    hicache_ratio: A[
+        float,
+        "The ratio of the size of host KV cache memory pool to the size of device pool.",
+        NS("memory"),
+    ] = 2.0
+    hicache_size: A[
+        int,
+        "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        NS("memory"),
+    ] = 0
+    hicache_write_policy: A[
+        str,
+        Arg(
+            help="The write policy of hierarchical cache.",
+            choices=["write_back", "write_through", "write_through_selective"],
+        ),
+        NS("memory"),
+    ] = "write_through"
+    hicache_io_backend: A[
+        str,
+        Arg(
+            help="The IO backend for KV cache transfer between CPU and GPU",
+            choices=["direct", "kernel", "kernel_ascend"],
+        ),
+        NS("memory"),
+    ] = "kernel"
+    hicache_mem_layout: A[
+        str,
+        Arg(
+            help="The layout of host memory pool for hierarchical cache.",
+            choices=[
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "page_first_kv_split",
+                "page_head",
+            ],
+        ),
+        NS("memory"),
+    ] = "page_first"
+    hicache_storage_backend: A[
+        Optional[str],
+        Arg(
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, ascend_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            choices=[
+                "file",
+                "mooncake",
+                "ascend_memcache",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "simm",
+                "mori",
+                "shm",
+            ],
+        ),
+        NS("memory"),
+    ] = None
+    hicache_storage_prefetch_policy: A[
+        str,
+        Arg(
+            help="Control when prefetching from the storage backend should stop.",
+            choices=["best_effort", "wait_complete", "timeout"],
+        ),
+        NS("memory"),
+    ] = "timeout"
+    hicache_storage_backend_extra_config: A[
+        Optional[str],
+        "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        NS("memory"),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Hierarchical sparse attention
+    # -------------------------------------------------------------------------
+    enable_hisparse: A[bool, "Enable hierarchical sparse attention", NS("memory")] = (
+        False
+    )
+    hisparse_config: A[
+        Optional[str],
+        Arg(
+            help='A dictionary in JSON string format for hierarchical sparse attention configuration. Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+            aliases=["--hierarchical-sparse-attention-extra-config"],
+        ),
+        NS("memory"),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Multi-modal optimization configs
+    # -------------------------------------------------------------------------
+    enable_broadcast_mm_inputs_process: A[
+        bool, "Enable broadcast mm-inputs process in scheduler.", NS("mm")
+    ] = False
+    enable_prefix_mm_cache: A[
+        bool,
+        "Enable prefix multimodal cache. Currently only supports mm-only.",
+        NS("mm"),
+    ] = False
+    mm_enable_dp_encoder: A[
+        bool,
+        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        NS("mm"),
+    ] = False
+    mm_process_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            type_parser=json.loads,
+        ),
+        NS("mm"),
+    ] = None
+    mm_processor_worker_num: A[
+        int,
+        "Number of threads for multimodal processor calls. 0 selects the "
+        "model-specific default. Only processors with isolated-worker support "
+        "can use more than one thread.",
+        NS("mm"),
+    ] = 0
+    mm_io_worker_num: A[
+        int,
+        "Number of threads for multimodal data loading and decoding. 0 selects "
+        "the model-specific default. SGLANG_IO_WORKERS remains supported as an "
+        "environment override when this argument is 0.",
+        NS("mm"),
+    ] = 0
+    limit_mm_data_per_request: A[
+        Optional[Union[str, Dict[str, int]]],
+        Arg(
+            help='Limit the number of multimodal inputs per request. e.g. \'{"image": 1, "video": 1, "audio": 1}\'',
+            type_parser=json.loads,
+        ),
+        NS("mm"),
+    ] = None
+    enable_mm_global_cache: A[
+        bool,
+        "Enable global multimodal embedding cache to skip redundant ViT inference.",
+        NS("mm"),
+    ] = False
+    disable_fast_image_processor: A[
+        bool, "Adopt base image processor instead of fast image processor.", NS("mm")
+    ] = False
+    mm_feature_transport: A[
+        Optional[Literal["cpu", "cuda_ipc"]],
+        "Transport multimodal features through CPU memory or a bounded CUDA IPC pool. "
+        "Unset resolves automatically: single-node CUDA deployments (without "
+        "disaggregation) use cuda_ipc, everything else uses cpu. CUDA IPC reserves "
+        "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and falls "
+        "back to CPU transport per tensor when the pool is full.",
+        NS("mm"),
+    ] = None
+    keep_mm_feature_on_device: A[
+        bool,
+        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
+        "multimodal feature transport.",
+        NS("mm"),
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # LoRA
+    # -------------------------------------------------------------------------
+    enable_lora: A[
+        Optional[bool],
+        "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+        NS("lora"),
+    ] = None
+    enable_lora_overlap_loading: A[
+        Optional[bool],
+        "Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.",
+        NS("lora"),
+    ] = None
+    max_lora_rank: A[
+        Optional[int],
+        "The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        NS("lora"),
+    ] = None
+    lora_target_modules: A[
+        Optional[Union[set[str], List[str]]],
+        Arg(
+            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted.",
+            nargs="*",
+            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
+        ),
+        NS("lora"),
+    ] = None
+    lora_paths: A[
+        Optional[Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]],
+        Arg(
+            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
+            action=LoRAPathAction,
+            action_kwargs={"type": str, "nargs": "*"},
+        ),
+        NS("lora"),
+    ] = None
+    max_loaded_loras: A[
+        Optional[int],
+        "If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `--max-loras-per-batch`.",
+        NS("lora"),
+    ] = None
+    max_loras_per_batch: A[
+        int,
+        "Maximum number of adapters for a running batch, include base-only request.",
+        NS("lora"),
+    ] = 8
+    lora_eviction_policy: A[
+        str,
+        Arg(
+            help="LoRA adapter eviction policy when memory pool is full. 'lru': Least Recently Used (default, better cache efficiency). 'fifo': First-In-First-Out.",
+            choices=["lru", "fifo"],
+        ),
+        NS("lora"),
+    ] = "lru"
+    lora_backend: A[
+        str,
+        Arg(
+            help="Choose the kernel backend for multi-LoRA serving.",
+            choices=LORA_BACKEND_CHOICES,
+        ),
+        NS("lora"),
+    ] = "csgmv"
+    max_lora_chunk_size: A[
+        Optional[int],
+        Arg(
+            help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+            choices=[16, 32, 64, 128],
+        ),
+        NS("lora"),
+    ] = 16
+    experts_shared_outer_loras: A[
+        Optional[bool],
+        Arg(
+            help="Force shared outer LoRA mode for MoE models. When set, w1/w3 lora_A and w2 lora_B are shared across experts (expert_dim=1). Use --no-experts-shared-outer-loras to force disable. By default this is auto-detected from adapter weights.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("lora"),
+    ] = None
+    lora_use_virtual_experts: A[
+        bool,
+        "Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+        NS("lora"),
+    ] = False
+    lora_strict_loading: A[
+        bool,
+        Arg(
+            help="Enable strict loading for LoRA adapters. When set, mismatched or missing keys in the adapter weights will raise an error.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("lora"),
+    ] = False
+    lora_drain_wait_threshold: A[
+        float,
+        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        NS("lora"),
+    ] = 0.0
+
+    # -------------------------------------------------------------------------
+    # Two batch overlap
+    # -------------------------------------------------------------------------
+    enable_two_batch_overlap: A[
+        bool, "Enabling two micro batches to overlap.", NS("exec.overlap")
+    ] = False
+    enable_single_batch_overlap: A[
+        bool,
+        "Let computation and communication overlap within one micro batch.",
+        NS("exec.overlap"),
+    ] = False
+    tbo_token_distribution_threshold: A[
+        float,
+        "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        NS("exec.overlap"),
+    ] = 0.48
+
+    # -------------------------------------------------------------------------
+    # Offloading
+    # -------------------------------------------------------------------------
+    cpu_offload_gb: A[
+        int, "How many GBs of RAM to reserve for CPU offloading.", NS("exec.offload")
+    ] = 0
+    offload_group_size: A[
+        int, "Number of layers per group in offloading.", NS("exec.offload")
+    ] = -1
+    offload_num_in_group: A[
+        int, "Number of layers to be offloaded within a group.", NS("exec.offload")
+    ] = 1
+    offload_prefetch_step: A[
+        int, "Steps to prefetch in offloading.", NS("exec.offload")
+    ] = 1
+    offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
+
+    # -------------------------------------------------------------------------
+    # LMCache
+    # -------------------------------------------------------------------------
+    enable_lmcache: A[
+        bool,
+        "Using LMCache as an alternative hierarchical cache solution",
+        NS("memory"),
+    ] = False
+    lmcache_config_file: A[
+        Optional[str], "Path to the LMCache YAML configuration file", NS("memory")
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # FlexKV
+    # -------------------------------------------------------------------------
+    enable_flexkv: A[
+        bool,
+        (
+            "Route the default RadixCache through FlexKV's KVManager for "
+            "host-tier (CPU / SSD / Remote) KV cache offload. Equivalent "
+            "to --radix-cache-backend=flexkv but also participates in the "
+            "auto-selection chain alongside --enable-lmcache."
+        ),
+        NS("memory"),
+    ] = False
+    flexkv_config_file: A[
+        Optional[str],
+        (
+            "Path to the FlexKV YAML / JSON configuration file. "
+            "Equivalent to setting the FLEXKV_CONFIG_PATH environment "
+            "variable."
+        ),
+        NS("memory"),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Ktransformers/AMX expert parallelism
+    # -------------------------------------------------------------------------
+    kt_weight_path: A[
+        Optional[str],
+        "[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        NS("exec.moe"),
+    ] = None
+    kt_method: A[
+        str,
+        "[ktransformers parameter] Quantization formats for CPU execution.",
+        NS("exec.moe"),
+    ] = "AMXINT4"
+    kt_cpuinfer: A[
+        Optional[int],
+        "[ktransformers parameter] The number of CPUInfer threads.",
+        NS("exec.moe"),
+    ] = None
+    kt_threadpool_count: A[
+        int,
+        "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        NS("exec.moe"),
+    ] = 2
+    kt_num_gpu_experts: A[
+        Optional[int],
+        "[ktransformers parameter] The number of GPU experts.",
+        NS("exec.moe"),
+    ] = None
+    kt_max_deferred_experts_per_token: A[
+        Optional[int],
+        "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        NS("exec.moe"),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Diffusion LLM
+    # -------------------------------------------------------------------------
+    dllm_algorithm: A[
+        Optional[str],
+        "The diffusion LLM algorithm, such as LowConfidence.",
+        NS("exec.dllm"),
+    ] = None
+    dllm_algorithm_config: A[
+        Optional[str],
+        "The diffusion LLM algorithm configurations. Must be a YAML file.",
+        NS("exec.dllm"),
+    ] = None
+    dllm_fdfo: A[
+        bool,
+        Arg(
+            help="Enable First-Done-First-Out (FDFO) scheduling for diffusion LLM inference. Enabled by default; use --no-dllm-fdfo to fall back to synchronous block scheduling.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("exec.dllm"),
+    ] = True
+
+    # -------------------------------------------------------------------------
+    # PD disaggregation
+    # -------------------------------------------------------------------------
+    disaggregation_mode: A[
+        Literal["null", "prefill", "decode"],
+        'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+        NS("disagg"),
+    ] = "null"
+    disaggregation_transfer_backend: A[
+        str,
+        Arg(
+            help="The backend for disaggregation transfer. Default is mooncake.",
+            choices=DISAGG_TRANSFER_BACKEND_CHOICES,
+        ),
+        NS("disagg"),
+    ] = "mooncake"
+    disaggregation_bootstrap_port: A[
+        int,
+        "Bootstrap server port on the prefill server. Default is 8998.",
+        NS("disagg"),
+    ] = 8998
+    disaggregation_ib_device: A[
+        Optional[str],
+        'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
+        NS("disagg"),
+    ] = None
+    disaggregation_decode_enable_radix_cache: A[
+        bool,
+        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
+        NS("disagg"),
+    ] = False
+    disaggregation_decode_enable_offload_kvcache: A[
+        bool,
+        "Enable async KV cache offloading on decode server (PD mode).",
+        NS("disagg"),
+    ] = False
+    num_reserved_decode_tokens: A[
+        int,
+        "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        NS("disagg"),
+    ] = 512
+    disaggregation_decode_extra_slots: A[
+        Optional[int],
+        "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",
+        NS("disagg"),
+    ] = None
+    disaggregation_decode_polling_interval: A[
+        int,
+        "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        NS("disagg"),
+    ] = 1
+    optimistic_prefill_attempts: A[
+        int,
+        "Number of optimistic prefill forward passes that skip the bootstrap wait.",
+        NS("disagg"),
+    ] = 0
+
+    # -------------------------------------------------------------------------
+    # Encode prefill disaggregation
+    # -------------------------------------------------------------------------
+    encoder_only: A[
+        bool, "For MLLM with an encoder, launch an encoder-only server", NS("disagg")
+    ] = False
+    language_only: A[
+        bool, "For VLM, load weights for the language model only.", NS("disagg")
+    ] = False
+    encoder_transfer_backend: A[
+        str,
+        Arg(
+            help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
+            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+        ),
+        NS("disagg"),
+    ] = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    encoder_urls: A[List[str], "List of encoder server urls.", NS("disagg")] = (
+        dataclasses.field(default_factory=list)
+    )
+    encoder_bootstrap_port: A[
+        int,
+        "Port for the EncoderBootstrapServer that runs in the language-only tokenizer manager process. Encoders register here, and language-only receivers fetch the current URL list from here.",
+        NS("disagg"),
+    ] = 8997
+    encoder_register_urls: A[
+        List[str],
+        "One or more EncoderBootstrapServer URLs to register this encoder with on startup, for dynamic encoder discovery. Example: --encoder-register-urls http://prefill0:8997 http://prefill1:8997. Used with --encoder-only servers.",
+        NS("disagg"),
+    ] = dataclasses.field(default_factory=list)
+    enable_adaptive_dispatch_to_encoder: A[
+        bool,
+        "When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        NS("disagg"),
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # PD-Multiplexing
+    # -------------------------------------------------------------------------
+    enable_pdmux: A[
+        bool, "Enable PD-Multiplexing, PD running on greenctx stream.", NS("disagg")
+    ] = False
+    pdmux_config_path: A[
+        Optional[str], "The path of the PD-Multiplexing config file.", NS("disagg")
+    ] = None
+    sm_group_num: A[int, "Number of sm partition groups.", NS("disagg")] = 8
+
+    # -------------------------------------------------------------------------
+    # Model weight update and weight loading
+    # -------------------------------------------------------------------------
+    custom_weight_loader: A[
+        Optional[List[str]],
+        Arg(
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+            nargs="*",
+        ),
+        NS("model"),
+    ] = None
+    weight_loader_disable_mmap: A[
+        bool, "Disable mmap while loading weight using safetensors.", NS("model")
+    ] = False
+    weight_loader_prefetch_checkpoints: A[
+        bool,
+        "Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards, reducing total network I/O on shared filesystems (NFS/Lustre) from N*checkpoint to 1*checkpoint. Recommended for models on network storage. When enabled, multi-threaded safetensors loading is disabled by default to avoid I/O oversubscription with the prefetch threads; set enable_multithread_load=true in --model-loader-extra-config to keep multi-threaded loading (e.g. on local NVMe where prefetch is a no-op).",
+        NS("model"),
+    ] = False
+    weight_loader_prefetch_num_threads: A[
+        int,
+        "Number of threads per rank for checkpoint prefetching (default: 4).",
+        NS("model"),
+    ] = 4
+    weight_loader_drop_cache_after_load: A[
+        bool,
+        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        NS("model"),
+    ] = False
+    remote_instance_weight_loader_seed_instance_ip: A[
+        Optional[str],
+        "The ip of the seed instance for loading weights from remote instance.",
+        NS("model"),
+    ] = None
+    remote_instance_weight_loader_seed_instance_service_port: A[
+        Optional[int],
+        "The service port of the seed instance for loading weights from remote instance.",
+        NS("model"),
+    ] = None
+    remote_instance_weight_loader_send_weights_group_ports: A[
+        Optional[List[int]],
+        Arg(
+            help="The communication group ports for loading weights from remote instance.",
+            type_parser=json_list_type,
+        ),
+        NS("model"),
+    ] = None
+    remote_instance_weight_loader_backend: A[
+        Literal["transfer_engine", "nccl", "modelexpress"],
+        "The backend for loading weights from remote instance. Can be 'transfer_engine', 'nccl', or 'modelexpress'. Default is 'nccl'.",
+        NS("model"),
+    ] = "nccl"
+    remote_instance_weight_loader_start_seed_via_transfer_engine: A[
+        bool,
+        "Start seed server via transfer engine backend for remote instance weight loader.",
+        NS("model"),
+    ] = False
+    engine_info_bootstrap_port: A[
+        int,
+        "Port for the engine info bootstrap server. Default is 6789. Must be set explicitly when running multiple instances on the same node.",
+        NS("model"),
+    ] = 6789
+    modelexpress_config: A[
+        Optional[str],
+        'JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
+        NS("model"),
+    ] = None
+    download_dir: A[
+        Optional[str], "Model download directory for huggingface.", NS("model")
+    ] = None
+    model_checksum: A[
+        Optional[str],
+        Arg(
+            help="Model file integrity verification. If provided without value, uses model-path as HF repo ID. Otherwise, provide checksums JSON file path or HuggingFace repo ID.",
+            nargs="?",
+            const="",
+        ),
+        NS("model"),
+    ] = None
+    delete_ckpt_after_loading: A[
+        bool, "Delete the model checkpoint after loading the model.", NS("model")
+    ] = False
+    # Checkpoint decryption
+    decrypted_config_file: A[
+        Optional[str], "The path of the decrypted config file.", NS("model")
+    ] = None
+    decrypted_draft_config_file: A[
+        Optional[str], "The path of the decrypted draft config file.", NS("model")
+    ] = None
+    checkpoint_engine_wait_weights_before_ready: A[
+        bool,
+        "If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods before serving inference requests.",
+        NS("model"),
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Prefill delayer
+    # -------------------------------------------------------------------------
+    enable_prefill_delayer: A[
+        bool,
+        "Enable prefill delayer for DP attention to reduce idle time.",
+        NS("schedule"),
+    ] = False
+    prefill_delayer_max_delay_passes: A[
+        int, "Maximum forward passes to delay prefill.", NS("schedule")
+    ] = 30
+    prefill_delayer_token_usage_low_watermark: A[
+        Optional[float],
+        "Token usage low watermark for prefill delayer.",
+        NS("schedule"),
+    ] = None
+    prefill_delayer_forward_passes_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
+        NS("schedule"),
+    ] = None
+    prefill_delayer_wait_seconds_buckets: A[
+        Optional[List[float]],
+        "Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+        NS("schedule"),
+    ] = None
+    prefill_delayer_queue_min_ratio: A[
+        Optional[float],
+        (
+            "Opt-in to the adaptive queue-based delay trigger (independent of the "
+            "slot-based one). Delays prefill until the waiting queue reaches "
+            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
+            "into a larger prefill. Unset (default) keeps the original slot-only "
+            "behavior. Typical: 0.1 ~ 0.5."
+        ),
+        NS("schedule"),
+    ] = None
+    prefill_delayer_max_delay_ms: A[
+        Optional[float],
+        (
+            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
+            "prefill is force-released to bound worst-case TTFT. Only consulted "
+            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
+            "5000; defaults to 5000 if unset."
+        ),
+        NS("schedule"),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Min free slots delay (prefill refill batching)
+    # -------------------------------------------------------------------------
+    min_free_slots_delay: A[
+        Optional[int],
+        (
+            "Hold new prefills until at least N running-request slots have freed "
+            "up, so they are admitted in one batch instead of one at a time. "
+            "Useful when each admission is disproportionately expensive, e.g. "
+            "speculative decoding with a separate draft prefill pass. Capped to "
+            "the DFlash formula (disabled when max-running-requests < 8; "
+            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
+            "this with the formula when unset; other workloads stay disabled."
+        ),
+        NS("schedule"),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Deterministic inference
     # -------------------------------------------------------------------------
     enable_deterministic_inference: A[
@@ -5986,13 +6771,17 @@ class ServerArgs:
             new_layout = "page_first_direct"
         elif self.hicache_io_backend == "kernel":
             new_layout = "page_first"
+        elif self.hicache_io_backend == "kernel_ascend":
+            new_layout = (
+                "page_first_kv_split" if self.use_mla_backend() else "page_first_direct"
+            )
         else:
-            # Keep current behavior for unknown backends (e.g., kernel_ascend).
+            # Keep current behavior for unknown backends.
             new_layout = self.hicache_mem_layout
 
         self.hicache_mem_layout = new_layout
         logger.warning(
-            f"Mooncake/Ascend Memcache storage backend does not support layer_first layout, "
+            f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 

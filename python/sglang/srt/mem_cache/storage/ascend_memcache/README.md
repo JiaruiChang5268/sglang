@@ -16,6 +16,18 @@ Related documentation:
 MemCache is a distributed cache system from Ascend, built on MemFabric underneath, and can provide a high-performance distributed memory pool.
 In SGLang HiCache, MemCache can be used as the L3 KV Cache backend to store and reuse KV cache.
 
+For Kimi K3, one logical cache entry contains both of the following pools:
+
+| SGLang pool | Kimi K3 state | Storage objects |
+| --- | --- | --- |
+| `kv` | Gated-MLA KV | K and V objects for every logical page |
+| `mamba` | KDA recurrent checkpoint | Temporal state and every convolution state |
+
+The entry is usable only when every required object exists. MLA is replicated
+across TP ranks, while KDA state is rank-sharded and therefore uses TP/PP/CP
+rank-scoped keys. When MLA selects `page_first_kv_split`, SGLang automatically
+uses `page_first_direct` for the KDA host sidecar.
+
 
 ## Install Ascend Memcache
 
@@ -30,17 +42,11 @@ pip install memcache_hybrid
 add `metaservice_config.json`
 ```json
 {
-    // Meta service start-up url; in K8s meta service master-standby HA, auto-set to Pod IP at startup
     "meta_service_url": "tcp://127.0.0.1:5000",
-
-    // Config store url; in K8s, auto-set to Pod IP at startup
     "config_store_url": "tcp://127.0.0.1:6000",
-
-    // HTTP metrics service url
     "metrics_url": "http://127.0.0.1:8000",
-
-    // Log level: debug, info, warn, error
-    "log_level": "info"
+    "log_level": "info",
+    "ubs_io_enable": true
 }
 ```
 
@@ -85,6 +91,9 @@ python -m sglang.launch_server \
 ```
 
 Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
+You can also pass a JSON file as
+`--hicache-storage-backend-extra-config @/path/to/localservice_config.json`, or
+set `SGLANG_HICACHE_MEMCACHE_CONFIG_PATH` to that file.
 
 | Key | Type | Required | Default | Valid range | Description |
 | --- | --- | --- | --- | --- | --- |
@@ -98,6 +107,42 @@ Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). K
 | `hbm_size` | string / integer | optional | `0` | [0, 1TB] | HBM pool size (same format as `dram_size`). Must be `0` when using `host_shm`. |
 | `max_dram_size` | string / integer | optional | `64GB` | [0, 1TB] | Max `dram_size` across all local processes. |
 | `max_hbm_size` | string / integer | optional | `0` | [0, 1TB] | Max `hbm_size` across all local processes. |
+
+## Enable the SSD tier
+
+SSD offload is implemented inside MemCache through UBS_IO. SGLang continues to
+use the same batch `put`, `exist`, and `get` calls and does not run a separate
+SSD allocator or eviction policy.
+
+Install the UBS_IO KV cache library (`libubsio_kvc.so`) and enable the following
+Python field in both the MemCache LocalService and MetaService configuration
+files:
+
+```json
+{
+  "ubs_io_enable": true
+}
+```
+
+SGLang also accepts the underlying MemCache spelling
+`"ock.mmc.ubs_io.enable": true` and maps it to the Python field. If SSD is
+requested but the installed `memcache_hybrid` package does not expose UBS_IO
+support, startup fails instead of silently falling back to DRAM-only mode.
+
+See the [MemCache UBS_IO usage guide](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_ssd_usage.md)
+for installation, SSD mount, and monitoring requirements. This setting is not a
+SGLang CLI option.
+
+To verify real SSD fallback, configure a deliberately small `dram_size`, write
+more Kimi cache data than that capacity, and confirm all of the following:
+
+1. MemCache metrics report DRAM eviction and SSD occupancy.
+2. `batch_is_exist` still reports the complete MLA + KDA entry.
+3. `batch_get_into` restores every component and generation matches the
+   no-HiCache baseline within the model's normal tolerance.
+
+`--dcp-size > 1` with an L3 storage backend is intentionally rejected until the
+storage namespace and MLA ownership rules become DCP-rank aware.
 
 
 For more options, see [MemCache Configuration Guide — LocalService Config](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_config.md#localservice-config).

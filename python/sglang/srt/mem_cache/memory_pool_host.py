@@ -1954,8 +1954,20 @@ class MambaPoolHost(HostKVCache):
         ]
 
     def get_hybrid_pool_buffer(self):
-        # Expose all mamba host tensors that need Mooncake buffer registration.
-        return [self.temporal_buffer, *self.conv_buffer]
+        # Keep this order aligned with get_hybrid_pool_component_names() and
+        # get_page_buffer_meta(): temporal first, then conv_0..conv_n.
+        buffers = []
+        if self.temporal_state_elem_size > 0:
+            buffers.append(self.temporal_buffer)
+        buffers.extend(self.conv_buffer)
+        return buffers
+
+    def get_hybrid_pool_component_names(self) -> list[str]:
+        names = []
+        if self.temporal_state_elem_size > 0:
+            names.append("temporal")
+        names.extend(f"conv_{i}" for i in range(len(self.conv_buffer)))
+        return names
 
     def _iter_page_tensors(self, index: int):
         if self.layout in ["page_first", "page_first_direct"]:
@@ -2144,6 +2156,103 @@ class MambaPoolHost(HostKVCache):
                 )
 
     @staticmethod
+    def _reshape_ascend_component(
+        device_tensor: torch.Tensor, host_tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Adapt one recurrent-state component to kvcacheio's 5-D contract.
+
+        Device state is layer-first and host state is page-first.  The trailing
+        state dimensions are flattened without changing slot identities, so
+        PrefixCache-provided global indices remain global at the kernel boundary.
+        """
+        if not device_tensor.is_contiguous() or not host_tensor.is_contiguous():
+            raise ValueError(
+                "Ascend Mamba/KDA HiCache transfer requires contiguous tensors"
+            )
+        if device_tensor.dtype != host_tensor.dtype:
+            raise ValueError(
+                "Mamba/KDA device/host dtype mismatch: "
+                f"device={device_tensor.dtype}, host={host_tensor.dtype}"
+            )
+        if device_tensor.shape[0] != host_tensor.shape[1]:
+            raise ValueError(
+                "Mamba/KDA device/host layer mismatch: "
+                f"device={device_tensor.shape[0]}, host={host_tensor.shape[1]}"
+            )
+        device_view = device_tensor.reshape(
+            device_tensor.shape[0], device_tensor.shape[1], 1, 1, -1
+        )
+        host_view = host_tensor.reshape(
+            host_tensor.shape[0], host_tensor.shape[1], 1, 1, -1
+        )
+        return device_view, host_view
+
+    def _transfer_ascend_components(
+        self,
+        device_pool: MambaPool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        direction,
+    ) -> None:
+        if host_indices is None or device_indices is None:
+            return
+        if host_indices.numel() == 0 and device_indices.numel() == 0:
+            return
+        if host_indices.numel() != device_indices.numel():
+            raise ValueError(
+                "Mamba/KDA transfer index count mismatch: "
+                f"host={host_indices.numel()}, device={device_indices.numel()}"
+            )
+        if len(device_pool.mamba_cache.conv) != len(self.conv_buffer):
+            raise ValueError(
+                "Mamba/KDA convolution component mismatch: "
+                f"device={len(device_pool.mamba_cache.conv)}, "
+                f"host={len(self.conv_buffer)}"
+            )
+
+        components = []
+        temporal = device_pool.mamba_cache.temporal
+        if temporal.numel() > 0:
+            components.append(
+                self._reshape_ascend_component(temporal, self.temporal_buffer)
+            )
+        components.extend(
+            self._reshape_ascend_component(device_tensor, host_tensor)
+            for device_tensor, host_tensor in zip(
+                device_pool.mamba_cache.conv, self.conv_buffer
+            )
+        )
+
+        component_idx = 0
+        while component_idx < len(components):
+            device_k, host_k = components[component_idx]
+            # The Ascend primitive transfers K and V with one call. Pair
+            # adjacent components when their dtypes match. For Kimi K3 the
+            # temporal state is normally fp32 and conv state bf16, so an odd
+            # component is safely self-paired; this duplicates that component's
+            # memcpy but preserves native dtype and zero-copy host buffers.
+            if (
+                component_idx + 1 < len(components)
+                and components[component_idx + 1][0].dtype == device_k.dtype
+            ):
+                device_v, host_v = components[component_idx + 1]
+                component_idx += 2
+            else:
+                device_v, host_v = device_k, host_k
+                component_idx += 1
+
+            transfer_kv_dim_exchange(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                device_k=device_k,
+                host_k=host_k,
+                device_v=device_v,
+                host_v=host_v,
+                page_size=self.page_size,
+                direction=direction,
+            )
+
+    @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
         dst: torch.Tensor,
@@ -2308,6 +2417,11 @@ class MambaPoolHost(HostKVCache):
                 f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
             )
         if io_backend == "kernel_ascend":
+            if self.layout != "page_first_direct":
+                raise ValueError(
+                    "Ascend Mamba/KDA HiCache requires page_first_direct layout, "
+                    f"got {self.layout}"
+                )
             # The dim-exchange kernel transfers all layers in one call; do it
             # once at layer_id == 0 and skip the remaining per-layer calls.
             if layer_id == 0:
@@ -2355,17 +2469,25 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend not in ["direct", "kernel_ascend"]:
-            raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct' or 'kernel_ascend', "
-                f"got '{io_backend}'."
+        if io_backend == "kernel_ascend":
+            if self.layout != "page_first_direct":
+                raise ValueError(
+                    "Ascend Mamba/KDA HiCache requires page_first_direct layout, "
+                    f"got {self.layout}"
+                )
+            self._transfer_ascend_components(
+                device_pool,
+                host_indices,
+                device_indices,
+                TransferDirection.D2H,
             )
-        if torch.distributed.get_rank() == 0 and device_indices.numel() > 0:
-            print(
-                f"[MambaPoolHost][L2-BACKUP] slots={device_indices.numel()} "
-                f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
-                f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
-            )
+            if torch.distributed.get_rank() == 0 and device_indices.numel() > 0:
+                print(
+                    f"[MambaPoolHost][L2-BACKUP] slots={device_indices.numel()} "
+                    f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
+                    f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
+                )
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
                 src_layers=device_pool.mamba_cache.temporal,

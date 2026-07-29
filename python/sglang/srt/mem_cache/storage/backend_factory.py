@@ -188,6 +188,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "ascend_memcache":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "mori":
             return backend_class(storage_config, mem_pool_host)
         else:

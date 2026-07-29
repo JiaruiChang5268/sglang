@@ -158,8 +158,9 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
   - `layer_first`: Compatible with GPU computation kernels (default for GPU memory)
   - `page_first`: Optimized for I/O efficiency
   - `page_first_direct`: Groups all tokens of a given layer within a page, allowing transfers from L2 to GPU to be aggregated at the page-layer level
+  - `page_first_kv_split`: Stores Ascend MLA K and V in separate page-first buffers. For hybrid Kimi models, the Mamba/KDA sidecar automatically uses `page_first_direct`.
 
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
+- **`--hicache-storage-backend {file,mooncake,ascend_memcache,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. `ascend_memcache` registers page-first host buffers for zero-copy access to MemCache/MemFabric DRAM; when UBS_IO is enabled in MemCache, cold objects transparently fall back to SSD. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
 
