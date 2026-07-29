@@ -6,9 +6,8 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
+export SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1
 # export TRITON_ALL_BLOCKS_PARALLEL=1
-# MODEL_PATH=/home/weights/Kimi-K3-int4
-# DRAFT_MODEL_PATH=/home/weights/DSpark-Kimi-K3-yi
 MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
 DRAFT_MODEL_PATH=/home/weights/RadixArk-Kimi-K3-DSpark
 
@@ -70,27 +69,33 @@ do
 	        --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
             --mem-fraction-static 0.78 \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs 16 \
+            --cuda-graph-bs 1 4 16 \
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 30000 \
             --reasoning-parser kimi_k3 \
 	        --moe-a2a-backend deepep \
             --deepep-mode auto \
-            --watchdog-timeout 9000  2>&1 | tee "/home/hanwlax/workspace/progress/kimi_k3/logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
+            --speculative-algorithm DSPARK \
+            --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+            --speculative-dspark-block-size 7 \
+            --speculative-draft-attention-backend ascend \
+            --speculative-eagle-topk 1 \
+            --speculative-draft-model-quantization unquant \
+            --watchdog-timeout 9000  2>&1 | tee "logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
         exit 1
     fi
 done
 
 exit 1
 
-sglang server \
-    --speculative-algorithm DSPARK \
-    --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
-    --speculative-dspark-block-size 7 \
-    --speculative-draft-attention-backend ascend \
-    --speculative-eagle-topk 1 \
-    --speculative-draft-model-quantization unquant \
+# spec options
+            --speculative-algorithm DSPARK \
+            --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+            --speculative-dspark-block-size 7 \
+            --speculative-draft-attention-backend ascend \
+            --speculative-eagle-topk 1 \
+            --speculative-draft-model-quantization unquant \
 
 python -m sglang.bench_serving \
   --dataset-path /home/zkk/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \

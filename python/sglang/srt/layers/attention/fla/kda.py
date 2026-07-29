@@ -4,6 +4,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import triton
@@ -1240,12 +1242,14 @@ def kda_gate_fwd_kernel(
     g_bias,
     beta: tl.constexpr,
     threshold: tl.constexpr,
+    lower_bound: tl.constexpr,
     T,
     H,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
@@ -1284,13 +1288,18 @@ def kda_gate_fwd_kernel(
         )
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if not USE_LOWER_BOUND:
+        # Standard gate: -exp(A_log) * softplus(g + bias)
+        # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
+        # When beta * x > threshold, use linear approximation x
+        # Use threshold to switch to linear when beta*x > threshold
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
+        b_y = b_a * sp
+    else:
+        # Safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias))
+        b_y = lower_bound * tl.sigmoid(-b_a * b_g)
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1302,6 +1311,7 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    lower_bound: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
@@ -1331,11 +1341,13 @@ def fused_kda_gate(
         g_bias,
         beta,
         threshold,
+        lower_bound,
         T,
         H,
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)

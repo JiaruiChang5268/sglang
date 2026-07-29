@@ -29,6 +29,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_retrieve_parent_token_token: tl.constexpr,
     # ================================================
     scale,
+    lower_bound,
     T,
     stride_a,
     stride_q,
@@ -51,6 +52,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    USE_LOWER_BOUND: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -161,14 +163,18 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        if USE_LOWER_BOUND:
+            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
+            
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
@@ -251,6 +257,7 @@ def fused_sigmoid_gating_delta_rule_update(
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
     scale: Optional[float] = None,
+    lower_bound: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
@@ -338,6 +345,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
+        lower_bound=lower_bound,
         T=T,
         stride_a=stride_a,
         stride_q=stride_q,
@@ -359,6 +367,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -22,8 +22,6 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.kda import chunk_kda
 
 if is_npu():
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update_npu
-    fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     from sglang.srt.hardware_backend.npu.kernels.kda_target_verify import (
         kda_target_verify_npu,
     )
@@ -450,6 +448,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         import os as _os
@@ -507,6 +506,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
         if _diag:

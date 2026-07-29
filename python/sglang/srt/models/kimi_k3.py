@@ -470,6 +470,7 @@ class KimiDeltaAttention(nn.Module):
         self.use_full_rank_gate = config.linear_attn_config.get(
             "use_full_rank_gate", False
         )
+        self.gate_lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
 
         # TODO: support fusion with quant
         self.do_fuse_qkvbfg = quant_config is None and not self.use_full_rank_gate
@@ -642,6 +643,7 @@ class KimiDeltaAttention(nn.Module):
             bias=bias,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
+            lower_bound=self.gate_lower_bound,
         )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
@@ -718,7 +720,7 @@ class KimiDeltaAttention(nn.Module):
         beta = beta.float()
         if not forward_batch.forward_mode.is_decode():
             forget_gate = fused_kda_gate(
-                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
+                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias, lower_bound=self.gate_lower_bound
             )
             beta = beta.sigmoid()
             forget_gate = forget_gate.unsqueeze(0)

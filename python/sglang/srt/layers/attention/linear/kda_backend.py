@@ -207,6 +207,7 @@ class KDAKernelDispatcher:
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.decode_kernel.decode(
@@ -220,6 +221,7 @@ class KDAKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=lower_bound,
             **kwargs,
         )
 
@@ -632,6 +634,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            lower_bound=getattr(layer, "lower_bound", None),
         )
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
