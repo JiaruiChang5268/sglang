@@ -50,6 +50,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -357,9 +358,19 @@ class KimiMoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
+        use_attn_tp_comm = (
+            is_dp_attention_enabled()
+            and get_parallel().attn_tp_size > 1
+            and get_moe_a2a_backend().is_none()
+        )
+        if use_attn_tp_comm:
+            gathered = get_local_dp_buffer(get_attention_tp_group())
+            attn_tp_all_gather_into_tensor(gathered, hidden_states)
+            hidden_states = gathered.view(-1, hidden_size)
+
         shared_output = None
         routed_hidden_states = hidden_states
-        if self.routed_expert_hidden_size is not None and num_tokens > 0:
+        if self.routed_expert_hidden_size is not None and hidden_states.shape[0] > 0:
             routed_hidden_states = self.routed_expert_down_proj(hidden_states)[0]
         elif self.routed_expert_hidden_size is not None:
             routed_hidden_states = hidden_states.new_empty(
@@ -375,7 +386,10 @@ class KimiMoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            shared_output = self._forward_shared_experts(hidden_states.clone())
+            if use_attn_tp_comm:
+                shared_output = self.shared_experts(hidden_states.clone())
+            else:
+                shared_output = self._forward_shared_experts(hidden_states.clone())
 
             with torch.cuda.stream(self.alt_stream):
                 router_logits, _ = self.gate(hidden_states)
@@ -385,8 +399,11 @@ class KimiMoE(nn.Module):
             current_stream.wait_stream(self.alt_stream)
         else:
             if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
-                shared_output = self._forward_shared_experts(hidden_states)
-            if num_tokens > 0:
+                if use_attn_tp_comm:
+                    shared_output = self.shared_experts(hidden_states)
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
+            if hidden_states.shape[0] > 0:
                 router_logits, _ = self.gate(hidden_states)
                 topk_output = self.topk(hidden_states, router_logits)
             else:
@@ -395,7 +412,7 @@ class KimiMoE(nn.Module):
                 )
             final_hidden_states = self.experts(routed_hidden_states, topk_output)
 
-        if self.routed_expert_hidden_size is not None and num_tokens > 0:
+        if self.routed_expert_hidden_size is not None and hidden_states.shape[0] > 0:
             final_hidden_states = self.routed_expert_norm(final_hidden_states)
             final_hidden_states = self.routed_expert_up_proj(final_hidden_states)[0]
         elif self.routed_expert_hidden_size is not None:
@@ -403,7 +420,18 @@ class KimiMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not is_dp_attention_enabled():
+        if use_attn_tp_comm:
+            final_hidden_states = attention_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
+            final_hidden_states = final_hidden_states.tensor_split(
+                get_parallel().attn_tp_size
+            )[get_parallel().attn_tp_rank]
+        elif (
+            self.tp_size > 1
+            and not is_dp_attention_enabled()
+            and get_moe_a2a_backend().is_none()
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -840,15 +868,17 @@ class KimiDecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
-        # 第一层是输入是TP-ATTN-FULL
-        if layer_idx == 0 and is_dp_attention_enabled() and get_parallel().attn_tp_size > 1:
-            self.layer_scatter_modes.layer_input_mode = ScatterMode.TP_ATTN_FULL
-        else:
-            self.layer_scatter_modes.layer_input_mode = ScatterMode.SCATTERED
-        self.layer_scatter_modes.mlp_mode = ScatterMode.SCATTERED
-        self.layer_scatter_modes.middle_residual_mode = ScatterMode.SCATTERED
-        if layer_idx != config.num_hidden_layers - 1:
-            self.layer_scatter_modes.layer_output_mode = ScatterMode.SCATTERED
+        if is_dp_attention_enabled():
+            if layer_idx == 0:
+                self.layer_scatter_modes.layer_input_mode = (
+                    ScatterMode.model_input_output()
+                )
+            else:
+                self.layer_scatter_modes.layer_input_mode = ScatterMode.SCATTERED
+            self.layer_scatter_modes.mlp_mode = ScatterMode.SCATTERED
+            self.layer_scatter_modes.middle_residual_mode = ScatterMode.SCATTERED
+            if layer_idx != config.num_hidden_layers - 1:
+                self.layer_scatter_modes.layer_output_mode = ScatterMode.SCATTERED
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -936,10 +966,13 @@ class KimiDecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        # Reuse framework: prepare_mlp (reduce_scatter TP_ATTN_FULL→SCATTERED, skip layernorm)
-        hidden_states, _ = self.layer_communicator.prepare_mlp(
-            hidden_states, None, forward_batch, skip_layernorm=True
-        )
+        # Reuse framework: prepare_mlp (reduce_scatter TP_ATTN_FULL->SCATTERED, skip layernorm)
+        if is_dp_attention_enabled():
+            hidden_states, _ = self.layer_communicator.prepare_mlp(
+                hidden_states, None, forward_batch, skip_layernorm=True
+            )
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # K3-specific: prefix_sum accumulation + apply_attn_res (SCATTERED, token-local)
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
@@ -969,6 +1002,8 @@ class KimiDecoderLayer(nn.Module):
                 hidden_states = hidden_states_full.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
             else:
                 hidden_states = self.mlp(hidden_states)
+                if self.attn_tp_size > 1:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, block_residual

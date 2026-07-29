@@ -1,8 +1,18 @@
 evalscope eval \
-    --model /home/weights/Kimi-K3-int4 \
-    --api-url http://192.168.25.209:30000/v1 \
+    --model /home/weights/Kimi-K3-w4a8-int-moe \
+    --api-url http://127.0.0.1:30000/v1 \
     --api-key EMPTY \
+    --work-dir "/home/hanwlax/workspace/progress/kimi_k3/gpqa/result_$(date +%Y-%m-%d_%H-%M-%S)" \
+    --no-timestamp \
     --eval-type openai_api \
+    --datasets gpqa_diamond \
+    --dataset-args '{
+      "gpqa_diamond": {
+        "local_path": "/home/hanwlax/datasets/gpqa",
+        "subset_list": ["gpqa_diamond"],
+        "default_subset": "gpqa_diamond"
+      }
+    }' \
     --generation-config '{
       "max_tokens": 131072,
       "timeout": 10000,
@@ -10,6 +20,7 @@ evalscope eval \
       "top_p": 0.95,
       "extra_body": {
         "reasoning_effort": "max"
-      }}' \
-    --datasets gpqa_diamond \
-    --eval-batch-size 32
+      }
+    }' \
+    --eval-batch-size 32 \
+    --seed 42

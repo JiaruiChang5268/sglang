@@ -7,8 +7,10 @@ sysctl -w kernel.sched_migration_cost_ns=50000
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
 # export TRITON_ALL_BLOCKS_PARALLEL=1
-MODEL_PATH=/home/weights/Kimi-K3-int4
-DRAFT_MODEL_PATH=/home/weights/DSpark-Kimi-K3-yi
+# MODEL_PATH=/home/weights/Kimi-K3-int4
+# DRAFT_MODEL_PATH=/home/weights/DSpark-Kimi-K3-yi
+MODEL_PATH=/home/weights/Kimi-K3-w4a8-int-moe
+DRAFT_MODEL_PATH=/home/weights/RadixArk-Kimi-K3-DSpark
 
 unset https_proxy
 unset http_proxy
@@ -33,7 +35,7 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 export HCCL_OP_EXPANSION_MODE=AIV
 
-export PYTHONPATH=/home/hanwlax/test-code/sglang/python:$PYTHONPATH
+export PYTHONPATH=/home/hanwlax/test-codes/sglang/python:$PYTHONPATH
 # export SGLANG_DSPARK_DEBUG_TRACE=${SGLANG_DSPARK_DEBUG_TRACE:-1}
 
 D_IP=('192.168.25.209' '192.168.25.212' '192.168.25.216' '192.168.25.217')
@@ -75,13 +77,7 @@ do
             --reasoning-parser kimi_k3 \
 	        --moe-a2a-backend deepep \
             --deepep-mode auto \
-            --speculative-algorithm DSPARK \
-            --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
-            --speculative-dspark-block-size 7 \
-            --speculative-draft-attention-backend ascend \
-            --speculative-eagle-topk 1 \
-            --speculative-draft-model-quantization unquant \
-            --watchdog-timeout 9000  2>&1 | tee "logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
+            --watchdog-timeout 9000  2>&1 | tee "/home/hanwlax/workspace/progress/kimi_k3/logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
         exit 1
     fi
 done
