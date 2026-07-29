@@ -46,6 +46,22 @@ def _get_allocator_type(server_args: ServerArgs) -> str:
     return get_allocator_type(server_args)
 
 
+def _resolve_mamba_host_layout(layout: str) -> str:
+    """Resolve the recurrent-state sidecar layout independently of MLA KV.
+
+    Ascend MLA uses a split K/V host layout, while Mamba/KDA stores temporal
+    and convolution state tensors.  Reusing ``page_first_kv_split`` for that
+    sidecar is both semantically wrong and rejected by ``MambaPoolHost``.
+    """
+    resolved = "page_first_direct" if layout == "page_first_kv_split" else layout
+    logger.info(
+        "Resolved hybrid HiCache host layouts: anchor=%s, Mamba/KDA=%s",
+        layout,
+        resolved,
+    )
+    return resolved
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -548,7 +564,7 @@ def build_hybrid_mamba_stack(
         server_args.hicache_ratio,
         server_args.hicache_size,
         allocator_type=_get_allocator_type(server_args),
-        layout=server_args.hicache_mem_layout,
+        layout=_resolve_mamba_host_layout(server_args.hicache_mem_layout),
     )
     entries = [
         build_pool_entry(
@@ -641,7 +657,7 @@ def build_hybrid_mamba_swa_stack(
         server_args.hicache_ratio,
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
+        layout=_resolve_mamba_host_layout(server_args.hicache_mem_layout),
     )
     entries = [
         build_pool_entry(

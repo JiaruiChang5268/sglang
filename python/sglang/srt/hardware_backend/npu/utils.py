@@ -77,13 +77,20 @@ def set_default_server_args(args: "ServerArgs"):
     # NPU does not support CustomAllReduce
     args.disable_custom_all_reduce = True
 
-    # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
-        args.hicache_io_backend = "kernel_ascend"
-        if args.use_mla_backend():
-            args.hicache_mem_layout = "page_first_kv_split"
-        else:
-            args.hicache_mem_layout = "page_first_direct"
+    # Handle hierarchical cache and decode-offload defaults. Explicit user
+    # choices are preserved; only generic defaults are specialized for NPU.
+    if (
+        args.enable_hierarchical_cache
+        or args.disaggregation_decode_enable_offload_kvcache
+    ):
+        if args.hicache_io_backend == "kernel":
+            args.hicache_io_backend = "kernel_ascend"
+
+        if args.hicache_mem_layout in ("layer_first", "page_first"):
+            if args.use_mla_backend():
+                args.hicache_mem_layout = "page_first_kv_split"
+            else:
+                args.hicache_mem_layout = "page_first_direct"
 
 
 @_call_once
