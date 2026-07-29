@@ -859,7 +859,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
-                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+                effort_key = (
+                    "thinking_effort" if self.is_kimi_k3 else "reasoning_effort"
+                )
+                extra_template_kwargs[effort_key] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 

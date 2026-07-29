@@ -335,6 +335,107 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK3Detector(BaseReasoningFormatDetector):
+    """Detector for Kimi-K3's XTML reasoning and response channels."""
+
+    THINK_START_TOKEN = "<|open|>think<|sep|>"
+    THINK_END_TOKEN = "<|close|>think<|sep|><|open|>response<|sep|>"
+    RESPONSE_END_TOKEN = "<|close|>response<|sep|>"
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            self.THINK_START_TOKEN,
+            self.THINK_END_TOKEN,
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+        self._phase = "reasoning"
+
+    @staticmethod
+    def _partial_marker_length(text: str, marker: str) -> int:
+        max_length = min(len(text), len(marker) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(marker[:length]):
+                return length
+        return 0
+
+    def _parse_response_buffer(self) -> StreamingParseResult:
+        end_index = self._buffer.find(self.RESPONSE_END_TOKEN)
+        if end_index >= 0:
+            normal_text = self._buffer[:end_index]
+            self._buffer = ""
+            self._phase = "done"
+            return StreamingParseResult(normal_text=normal_text)
+
+        keep_length = self._partial_marker_length(
+            self._buffer, self.RESPONSE_END_TOKEN
+        )
+        if keep_length:
+            normal_text = self._buffer[:-keep_length]
+            self._buffer = self._buffer[-keep_length:]
+        else:
+            normal_text = self._buffer
+            self._buffer = ""
+        return StreamingParseResult(normal_text=normal_text)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if text.startswith(self.THINK_START_TOKEN):
+            text = text[len(self.THINK_START_TOKEN) :]
+
+        if self.THINK_END_TOKEN not in text:
+            return StreamingParseResult(reasoning_text=text)
+
+        reasoning_text, normal_text = text.split(self.THINK_END_TOKEN, maxsplit=1)
+        normal_text = normal_text.split(self.RESPONSE_END_TOKEN, maxsplit=1)[0]
+        return StreamingParseResult(
+            normal_text=normal_text, reasoning_text=reasoning_text
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if self._phase == "done":
+            return StreamingParseResult()
+
+        self._buffer += new_text
+        if self._phase == "response":
+            return self._parse_response_buffer()
+
+        end_index = self._buffer.find(self.THINK_END_TOKEN)
+        if end_index >= 0:
+            reasoning_text = self._buffer[:end_index]
+            if reasoning_text.startswith(self.THINK_START_TOKEN):
+                reasoning_text = reasoning_text[len(self.THINK_START_TOKEN) :]
+            self._buffer = self._buffer[end_index + len(self.THINK_END_TOKEN) :]
+            self._phase = "response"
+            response_result = self._parse_response_buffer()
+            return StreamingParseResult(
+                normal_text=response_result.normal_text,
+                reasoning_text=reasoning_text,
+            )
+
+        if not self.stream_reasoning:
+            return StreamingParseResult()
+
+        keep_length = self._partial_marker_length(self._buffer, self.THINK_END_TOKEN)
+        if keep_length:
+            reasoning_text = self._buffer[:-keep_length]
+            self._buffer = self._buffer[-keep_length:]
+        else:
+            reasoning_text = self._buffer
+            self._buffer = ""
+
+        if reasoning_text.startswith(self.THINK_START_TOKEN):
+            reasoning_text = reasoning_text[len(self.THINK_START_TOKEN) :]
+        return StreamingParseResult(reasoning_text=reasoning_text)
+
+
 class Glm45Detector(BaseReasoningFormatDetector):
     """
     Detector for GLM-4.5 models.
@@ -1075,6 +1176,7 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
+        "kimi_k3": KimiK3Detector,
         "mimo": _MimoDetector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,

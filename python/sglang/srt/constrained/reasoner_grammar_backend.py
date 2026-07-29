@@ -51,7 +51,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def __init__(
         self,
         grammar: Optional[BaseGrammarObject],
-        think_end_id: int,
+        think_end_id: Union[int, List[int]],
         think_excluded_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
@@ -62,7 +62,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
     ):
         super().__init__()
         self.grammar = grammar
-        self.think_end_id = think_end_id
+        self.think_end_ids = (
+            [think_end_id] if isinstance(think_end_id, int) else list(think_end_id)
+        )
+        if not self.think_end_ids:
+            raise ValueError("think_end_id must contain at least one token id.")
+        # Keep the legacy attribute for callers that only inspect single-token
+        # reasoning formats.
+        self.think_end_id = self.think_end_ids[0]
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
@@ -70,12 +77,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
-        self._think_end_id_list = [think_end_id]
+        self._think_end_match_len = 0
+        self._state_history = []
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
 
     def maybe_init_reasoning(self, reasoning: bool):
+        self._think_end_match_len = 0
+        self._state_history = []
         if reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
@@ -89,16 +99,48 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _is_generation(self):
         return self.tokens_after_end >= 0
 
+    def _transfer_thinking_state(self, token: int) -> None:
+        candidate = (
+            self.think_end_ids[: self._think_end_match_len] + [token]
+        )
+        if candidate == self.think_end_ids:
+            self._think_end_match_len = 0
+            self.tokens_after_end = 0
+            return
+
+        max_prefix_len = min(len(candidate), len(self.think_end_ids) - 1)
+        new_match_len = 0
+        for prefix_len in range(max_prefix_len, 0, -1):
+            if candidate[-prefix_len:] == self.think_end_ids[:prefix_len]:
+                new_match_len = prefix_len
+                break
+
+        # Tokens retained as a possible marker prefix are not counted as
+        # reasoning until a mismatch proves that they are ordinary content.
+        self.tokens_in_think += len(candidate) - new_match_len
+        self._think_end_match_len = new_match_len
+
     def transfer_state(self, token: int) -> None:
+        self._state_history.append(
+            (
+                self.tokens_in_think,
+                self.tokens_after_end,
+                self._think_end_match_len,
+            )
+        )
         if self._is_thinking():
-            if token == self.think_end_id:
-                self.tokens_after_end = 0
-            else:
-                self.tokens_in_think += 1
+            self._transfer_thinking_state(token)
         elif self._is_generation():
             self.tokens_after_end += 1
 
     def rollback_state(self):
+        if self._state_history:
+            (
+                self.tokens_in_think,
+                self.tokens_after_end,
+                self._think_end_match_len,
+            ) = self._state_history.pop()
+            return
         if self._is_thinking():
             if self.tokens_in_think > 0:
                 self.tokens_in_think -= 1
@@ -151,7 +193,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 )
             else:
                 self._do_token_filter(
-                    vocab_mask, self._think_end_id_list, idx, is_allowed=True
+                    vocab_mask,
+                    [self.think_end_ids[self._think_end_match_len]],
+                    idx,
+                    is_allowed=True,
                 )
             return
         if self._is_generation() and self.grammar is not None:
@@ -180,7 +225,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def copy(self):
         new_obj = ReasonerGrammarObject(
             self.grammar.copy() if self.grammar is not None else None,
-            self.think_end_id,
+            self.think_end_ids,
             self.think_excluded_token_ids,
             self.max_think_tokens,
             self.enable_token_filter,
@@ -191,6 +236,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
+        new_obj._think_end_match_len = self._think_end_match_len
+        new_obj._state_history = list(self._state_history)
         new_obj._finished = self._finished
         return new_obj
 
@@ -242,12 +289,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
                 f"could not be encoded by the tokenizer."
             )
-        if len(think_end_ids) != 1:
-            raise ValueError(
-                f"think_end_token '{reasoning_parser.detector.think_end_token}' "
-                "must encode to exactly one token for constrained reasoning."
-            )
-        self.think_end_id = think_end_ids[0]
+        self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -298,7 +340,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ) -> ReasonerGrammarObject:
         obj = ReasonerGrammarObject(
             grammar=grammar,
-            think_end_id=self.think_end_id,
+            think_end_id=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,

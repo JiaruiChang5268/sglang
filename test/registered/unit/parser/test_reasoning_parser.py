@@ -10,6 +10,7 @@ from sglang.srt.parser.reasoning_parser import (
     HunyuanDetector,
     KimiDetector,
     KimiK2Detector,
+    KimiK3Detector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -363,6 +364,54 @@ class TestKimiK2Detector(CustomTestCase):
         result = self.detector.parse_streaming_increment("<|tool_call_begin|>")
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "<|tool_call_begin|>")
+
+
+class TestKimiK3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = KimiK3Detector()
+
+    def test_detect_and_parse_xtml(self):
+        text = (
+            "Think step by step."
+            "<|close|>think<|sep|><|open|>response<|sep|>"
+            "ANSWER: B"
+            "<|close|>response<|sep|><|close|>message<|sep|>"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Think step by step.")
+        self.assertEqual(result.normal_text, "ANSWER: B")
+
+    def test_detect_and_parse_truncated_reasoning(self):
+        result = self.detector.detect_and_parse("Still reasoning")
+        self.assertEqual(result.reasoning_text, "Still reasoning")
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_xtml_split_across_chunks(self):
+        reasoning_text = ""
+        normal_text = ""
+        for chunk in [
+            "Think",
+            "ing<|close|>thi",
+            "nk<|sep|><|open|>response<|sep|>ANS",
+            "WER: A<|close|>res",
+            "ponse<|sep|><|close|>message<|sep|>",
+        ]:
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning_text += result.reasoning_text
+            normal_text += result.normal_text
+
+        self.assertEqual(reasoning_text, "Thinking")
+        self.assertEqual(normal_text, "ANSWER: A")
+
+    def test_non_streaming_reasoning_accumulates(self):
+        detector = KimiK3Detector(stream_reasoning=False)
+        first = detector.parse_streaming_increment("Think")
+        second = detector.parse_streaming_increment(
+            "ing<|close|>think<|sep|><|open|>response<|sep|>ANSWER: C"
+        )
+        self.assertEqual(first.reasoning_text, "")
+        self.assertEqual(second.reasoning_text, "Thinking")
+        self.assertEqual(second.normal_text, "ANSWER: C")
 
 
 class TestGlm45Detector(CustomTestCase):
@@ -830,6 +879,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("kimi_k2")
         self.assertIsInstance(parser.detector, KimiK2Detector)
+
+        parser = ReasoningParser("kimi_k3")
+        self.assertIsInstance(parser.detector, KimiK3Detector)
 
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)

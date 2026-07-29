@@ -33,7 +33,7 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 export HCCL_OP_EXPANSION_MODE=AIV
 
-export PYTHONPATH=/home/fuyong/codes/sglang/python:$PYTHONPATH
+export PYTHONPATH=/home/hanwlax/test-code/sglang/python:$PYTHONPATH
 # export SGLANG_DSPARK_DEBUG_TRACE=${SGLANG_DSPARK_DEBUG_TRACE:-1}
 
 D_IP=('192.168.25.209' '192.168.25.212' '192.168.25.216' '192.168.25.217')
@@ -69,13 +69,12 @@ do
             --mem-fraction-static 0.78 \
             --chunked-prefill-size 8192 \
             --cuda-graph-bs 16 \
-            --disable-radix-cache \
             --max-running-requests 64 \
             --host 0.0.0.0 \
             --port 30000 \
+            --reasoning-parser kimi_k3 \
 	        --moe-a2a-backend deepep \
-    	    --deepep-mode auto \
-            --disable-radix-cache \
+            --deepep-mode auto \
             --speculative-algorithm DSPARK \
             --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
             --speculative-dspark-block-size 7 \
@@ -83,13 +82,19 @@ do
             --speculative-eagle-topk 1 \
             --speculative-draft-model-quantization unquant \
             --watchdog-timeout 9000  2>&1 | tee "logs/run_32p_mix_$(date +%Y-%m-%d_%H-%M-%S).log"
-            # --disable-cuda-graph
-
         exit 1
     fi
 done
 
 exit 1
+
+sglang server \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
+    --speculative-dspark-block-size 7 \
+    --speculative-draft-attention-backend ascend \
+    --speculative-eagle-topk 1 \
+    --speculative-draft-model-quantization unquant \
 
 python -m sglang.bench_serving \
   --dataset-path /home/zkk/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
