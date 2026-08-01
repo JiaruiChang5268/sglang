@@ -135,7 +135,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
-        elif self.layout == "page_first_direct":
+        # MHA K and V have equal size (head_num * head_dim), so page_first_kv_split
+        # shares the interleaved kv_buffer layout with page_first_direct.
+        elif self.layout in ["page_first_direct", "page_first_kv_split"]:
             dims = (
                 2,
                 self.page_num,
@@ -308,7 +310,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
+            if self.layout in ["page_first_direct", "page_first_kv_split"]:
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
                     transfer_kv_dim_exchange(
@@ -415,7 +417,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
+            if self.layout in ["page_first_direct", "page_first_kv_split"]:
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
@@ -572,7 +574,12 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct", "page_head"]:
+        elif self.layout in [
+            "page_first",
+            "page_first_direct",
+            "page_head",
+            "page_first_kv_split",
+        ]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
