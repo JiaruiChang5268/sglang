@@ -808,6 +808,13 @@ class HiRadixCache(RadixCache):
             self._track_write_through_node(node, len(node.key))
             if not write_back:
                 self.inc_lock_ref(node)
+            logger.info(
+                "HiCache write_backup D->H: backed_up=%d tokens, node_id=%d, "
+                "write_back=%s",
+                len(host_indices),
+                node.id,
+                write_back,
+            )
         else:
             return 0
 
@@ -883,6 +890,13 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        logger.info(
+            "HiCache write_backup_storage H->L3: backed_up=%d tokens, node_id=%d, "
+            "op_id=%d",
+            len(host_value),
+            node.id,
+            operation_id,
+        )
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1256,10 +1270,27 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        logger.info(
+            "HiCache load_back: L2_host_tokens=%d, nodes_to_load=%d, "
+            "node_id=%d, threshold=%d, mem_quota=%s, delta=%d",
+            len(host_indices),
+            len(nodes_to_load),
+            last_hit_node.id,
+            self.load_back_threshold,
+            mem_quota,
+            delta,
+        )
         if len(host_indices) < self.load_back_threshold or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
+            logger.info(
+                "HiCache load_back: SKIP (too small or quota exceeded), "
+                "host_tokens=%d, threshold=%d, node_id=%d",
+                len(host_indices),
+                self.load_back_threshold,
+                last_hit_node.id,
+            )
             self.dec_lock_ref(ancester_node)
             return None
 
@@ -1305,6 +1336,13 @@ class HiRadixCache(RadixCache):
             self._record_store_event(node, medium=StorageMedium.GPU)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+        logger.info(
+            "HiCache load_back: SUCCESS L2->L1 loaded=%d tokens, node_id=%d, "
+            "duration=%.3fms",
+            len(device_indices),
+            last_hit_node.id,
+            (time.perf_counter() - start_time) * 1000,
+        )
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
@@ -1321,13 +1359,23 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
+            logger.info(
+                "HiCache init_load_back: node_id=%d is EVICTED, triggering L2->L1 load_back",
+                last_node.id,
+            )
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                logger.info(
+                    "HiCache init_load_back: SUCCESS loaded=%d tokens, node_id=%d",
+                    len(loading_values),
+                    last_node.id,
                 )
                 return loading_values, last_node
 
+            logger.info(
+                "HiCache init_load_back: FAILED for node_id=%d, falling back to parent",
+                last_node.id,
+            )
             while last_node.evicted:
                 last_node = last_node.parent
 
@@ -1379,6 +1427,12 @@ class HiRadixCache(RadixCache):
         )
         storage_hit_count = storage_hit_count_tensor.item()
         storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        logger.info(
+            "HiCache L3 storage_hit_query: L3_hit=%d tokens (requested=%d), node_id=%d",
+            storage_hit_count,
+            len(prefetch_key),
+            last_host_node.id,
+        )
         return storage_hit_count
 
     def ready_to_load_host_cache(self) -> int:
@@ -1479,6 +1533,10 @@ class HiRadixCache(RadixCache):
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
+            logger.info(
+                "HiCache check_prefetch_progress: req_id=%s, no ongoing prefetch",
+                req_id,
+            )
             return True
 
         # todo: more policies for prefetch progress such as timeout
@@ -1489,9 +1547,17 @@ class HiRadixCache(RadixCache):
 
         if operation.host_indices is None:
             # prefetch has not been issued due to insufficient host memory
+            logger.info(
+                "HiCache check_prefetch_progress: req_id=%s, insufficient host memory",
+                req_id,
+            )
             return True
 
         if not self.can_terminate_prefetch(operation):
+            logger.info(
+                "HiCache check_prefetch_progress: req_id=%s, not completed",
+                req_id,
+            )
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -1515,6 +1581,18 @@ class HiRadixCache(RadixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
+        loaded_from_storage = min_completed_tokens - matched_length
+        logger.info(
+            "HiCache check_prefetch_progress: req_id=%s, completed=%d, "
+            "L3_fetched=%d, host_matched=%d, L3_loaded=%d, node_id=%d",
+            req_id,
+            min_completed_tokens,
+            min_completed_tokens,
+            matched_length,
+            loaded_from_storage,
+            last_host_node.id,
+        )
+
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
@@ -1524,7 +1602,6 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:
@@ -1573,6 +1650,13 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        logger.info(
+            "HiCache match_prefix: L1_device_hit=%d, L2_host_hit=%d, node_id=%d",
+            len(value),
+            host_hit_length,
+            last_host_node.id,
+        )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1603,6 +1687,15 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            logger.info(
+                "HiCache prefetch_from_storage: SKIP req_id=%s, prefetch_length=%d, "
+                "threshold=%d, enable_storage=%s, rate_limited=%s",
+                req_id,
+                prefetch_length,
+                self.prefetch_threshold,
+                self.enable_storage,
+                self.cache_controller.prefetch_rate_limited(),
+            )
             return
 
         last_host_node.protect_host()
@@ -1632,6 +1725,14 @@ class HiRadixCache(RadixCache):
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
+        )
+        logger.info(
+            "HiCache prefetch_from_storage: ISSUED req_id=%s, prefetch_length=%d, "
+            "node_id=%d, host_avail=%d",
+            req_id,
+            prefetch_length,
+            last_host_node.id,
+            self.cache_controller.mem_pool_host.available_size(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
