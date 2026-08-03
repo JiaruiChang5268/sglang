@@ -236,8 +236,14 @@ def set_default_server_args(args: "ServerArgs"):
     args.disable_custom_all_reduce = True
 
     # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
-        args.hicache_io_backend = "kernel_ascend"
+    if (
+        args.enable_hierarchical_cache
+        or args.disaggregation_decode_enable_offload_kvcache
+    ):
+        # Respect user override; only patch default values
+        if args.hicache_io_backend == "kernel":
+            args.hicache_io_backend = "kernel_ascend"
+
         if args.use_mla_backend():
             args.hicache_mem_layout = "page_first_kv_split"
         else:
@@ -384,10 +390,45 @@ def init_zbal(world_size, gpu_id, world_rank, do_check=True):
     from zbal import is_mix_alloc, switch_to_allocator, zbal_init
 
     if is_mix_alloc():
+        logger.info(
+            f"[ZBAL] mix_alloc mode: eager init (rank={world_rank}, world_size={world_size}, "
+            f"gpu_id={gpu_id}, zbal_mem_size={zbal_mem_size}MB)"
+        )
         switch_to_allocator()
-        # use lazy init for mix alloc
-        return 1
+        # Eager init: call zbal_bootstrap immediately so that gGVASpaceInited=true
+        # before init_torch_distributed. This avoids the pre-bootstrap DMA fallback
+        # path (AclrtMallocAlign32) which fails on A5 NPU.
+        zbal_mem_bytes = zbal_mem_size * (1024**2)
+        logger.info(
+            f"[ZBAL] calling zbal_init: world_size={world_size}, rank={world_rank}, "
+            f"device={gpu_id}, mem_size={zbal_mem_size}MB ({zbal_mem_bytes} bytes)"
+        )
+        if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+            ret = zbal_init(
+                world_size,
+                gpu_id,
+                world_rank,
+                zbal_mem_bytes,
+                ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+            )
+        else:
+            ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_bytes)
+
+        gva_is_inited = True
+        logger.info(
+            f"[ZBAL] zbal_init done: ret={ret}, gva_is_inited={gva_is_inited}"
+        )
+
+        if do_check and not ret:
+            logger.error("[ZBAL] zbal init failed!")
+            sys.exit(-1)
+
+        return ret
     else:
+        logger.info(
+            f"[ZBAL] non-mix mode: init (rank={world_rank}, world_size={world_size}, "
+            f"gpu_id={gpu_id}, zbal_mem_size={zbal_mem_size}MB)"
+        )
         if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
             ret = zbal_init(
                 world_size,
@@ -400,6 +441,9 @@ def init_zbal(world_size, gpu_id, world_rank, do_check=True):
             ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_size * (1024**2))
 
         gva_is_inited = True
+        logger.info(
+            f"[ZBAL] zbal_init done: ret={ret}, gva_is_inited={gva_is_inited}"
+        )
 
         if do_check and not ret:
             logger.error("[ZBAL] zbal init failed!")
@@ -423,6 +467,13 @@ def lazy_init_zbal_gva_mem(
         return 1
 
     global gva_is_inited
+
+    if gva_is_inited:
+        logger.info(
+            f"[ZBAL] rank {world_rank}: gva already inited (eager mode), skip lazy init"
+        )
+        return 1
+
     from sglang.srt.utils.common import get_available_gpu_memory
 
     # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
@@ -440,9 +491,12 @@ def lazy_init_zbal_gva_mem(
     used_memory_in_mb = int(used_memory * 1024)
     gva_in_mb = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() - used_memory_in_mb
     gva_in_mb = gva_in_mb - gva_in_mb % 128  # align to 128MB
-    print(f"[ZBAL] rank {world_rank} allocated {gva_in_mb} MB gva space.")
+    logger.info(
+        f"[ZBAL] rank {world_rank} lazy init: total={total_memory}GB, "
+        f"free={free_gpu_memory}GB, used={used_memory}GB, "
+        f"gva={gva_in_mb}MB"
+    )
 
-    assert not gva_is_inited, "zbal gva should be inited only once"
     # zbal_set_logger_level(0)
     if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
         res = zbal_init(
@@ -456,6 +510,7 @@ def lazy_init_zbal_gva_mem(
         res = zbal_init(world_size, gpu_id, world_rank, gva_in_mb * (1024**2))
 
     gva_is_inited = True
+    logger.info(f"[ZBAL] rank {world_rank} lazy init done: ret={res}")
     if do_check and not res:
         logger.error("[ZBAL] zbal lazy init failed!")
         sys.exit(-1)

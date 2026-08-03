@@ -382,6 +382,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            # print(f"[UnifiedRadixCache] try_match_prefix: {result}")
             return result
         if self.disable:
             return self.tree_core.empty_match_result

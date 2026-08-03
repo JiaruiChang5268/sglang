@@ -115,6 +115,11 @@ def maybe_register_hicache_draft(
         pool_label="draft",
     )
     if isinstance(pool, MHATokenToKVPool):
+        # The global layout is page_first_kv_split only when the target model
+        # uses MLA; that layout is MLA-specific, so MHA draft pools must use
+        # the non-MLA layout (NPU default: page_first_direct).
+        if kw["layout"] == "page_first_kv_split":
+            kw["layout"] = "page_first_direct"
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)

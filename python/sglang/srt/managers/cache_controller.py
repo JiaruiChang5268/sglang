@@ -495,7 +495,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in ["hf3fs", "mooncake", "ascend_memcache", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -1073,8 +1073,9 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                    logger.info(
+                        f"[L3-MISS] Revoking prefetch for request {operation.request_id} "
+                        f"due to insufficient hits ({storage_hit_count} < {self.prefetch_threshold})."
                     )
                 else:
                     # Record hit count, so the scheduler thread will know the exact memory to allocate
@@ -1083,6 +1084,10 @@ class HiCacheController:
                     ]
                     operation.storage_hit_count = storage_hit_count
                     self.prefetch_hit_queue.put(operation)
+                    logger.info(
+                        f"[L3-HIT] Prefetching {len(operation.hash_value)} pages "
+                        f"({storage_hit_count} tokens) for request {operation.request_id}."
+                    )
 
             except Empty:
                 continue
@@ -1221,6 +1226,10 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
+                    logger.info(
+                        f"[L3-BACKUP] Backed up {len(operation.hash_value) if operation.hash_value else 0} "
+                        f"pages to storage for op {operation.id}."
+                    )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

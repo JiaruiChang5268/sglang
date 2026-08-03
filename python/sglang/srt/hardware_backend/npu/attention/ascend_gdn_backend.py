@@ -243,6 +243,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
             conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
 
+            # CPU-known values so causal_conv1d skips the GPU->host sync
+            # (seqlens.max() / has_initial_state.any()) that would otherwise
+            # block on a deep GPU queue. seqlens == extend_seq_lens for extend.
+            max_seq_len = (
+                max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.extend_seq_lens_cpu is not None
+                else seq_len
+            )
+            has_any_initial = any(
+                p > 0 for p in (forward_batch.extend_prefix_lens_cpu or [])
+            )
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
@@ -252,7 +263,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                max_seq_len=max_seq_len,
+                has_any_initial=has_any_initial,
+                cu_seq_len=seq_len,
+                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
                 1, 2

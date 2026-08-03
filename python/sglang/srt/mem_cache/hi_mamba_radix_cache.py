@@ -710,11 +710,15 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
+            logger.debug(f"[MambaEvict] SKIP (tree_cache disabled)")
             return EvictResult()
 
         full_num_tokens = params.num_tokens
         full_num_evicted = 0
         mamba_num_evicted = 0
+
+        mamba_avail_before = self.req_to_token_pool.mamba_allocator.available_size()
+        mamba_evictable = len(self.evictable_mamba_device_leaves) if hasattr(self, 'evictable_mamba_device_leaves') else 'N/A'
 
         if full_num_tokens > 0:
             leaves = list(self.evictable_full_device_leaves)
@@ -736,6 +740,14 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if params.mamba_num > 0:
             mamba_num_evicted += self.evict_mamba(params.mamba_num)
+
+        mamba_avail_after = self.req_to_token_pool.mamba_allocator.available_size()
+        logger.info(
+            f"[MambaEvict] requested_tokens={full_num_tokens} requested_mamba={params.mamba_num} "
+            f"evicted_tokens={full_num_evicted} evicted_mamba={mamba_num_evicted} "
+            f"mamba_evictable_leaves={mamba_evictable} "
+            f"avail_before={mamba_avail_before} avail_after={mamba_avail_after}"
+        )
 
         return EvictResult(
             num_tokens_evicted=full_num_evicted,

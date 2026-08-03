@@ -520,7 +520,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        result = self._match_post_processor(params, value, last_node, best_value_len)
+        # print(f"[MambaRadixCache] match_prefix: {result}")
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -547,6 +549,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, :kv_len_to_handle
             ]
             self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
+            logger.debug(
+                f"[MambaCacheFinish] DISABLED rid={req.rid} slot={req.mamba_pool_idx} "
+                f"avail_before={self.req_to_token_pool.mamba_allocator.available_size()}"
+            )
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
@@ -655,6 +661,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             else mamba_exist
         )
 
+        logger.debug(
+            f"[MambaCacheFinish] rid={req.rid} slot={req.mamba_pool_idx} "
+            f"is_insert={is_insert} mamba_exist={mamba_exist} "
+            f"free_mamba_cache={free_mamba_cache} "
+            f"enable_mamba_extra_buffer={self.enable_mamba_extra_buffer} "
+            f"int8_ckpt_pool={self.int8_ckpt_pool is not None} "
+            f"avail={self.req_to_token_pool.mamba_allocator.available_size()}"
+        )
         if free_mamba_cache:
             self.req_to_token_pool.free_mamba_cache(
                 req,

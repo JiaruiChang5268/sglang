@@ -2641,7 +2641,7 @@ class ServerArgs:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, ascend_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "mooncake",
@@ -2653,6 +2653,7 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
+                "ascend_memcache",
             ],
         ),
         NS("memory"),
@@ -7245,7 +7246,7 @@ class ServerArgs:
 
     def _resolve_storage_layout_compatibility(self):
         if (
-            self.hicache_storage_backend != "mooncake"
+            self.hicache_storage_backend not in ("mooncake", "ascend_memcache")
             or self.hicache_mem_layout != "layer_first"
         ):
             return
@@ -7260,7 +7261,7 @@ class ServerArgs:
 
         self.hicache_mem_layout = new_layout
         logger.warning(
-            f"Mooncake storage backend does not support layer_first layout, "
+            f"Mooncake/Ascend Memcache storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 

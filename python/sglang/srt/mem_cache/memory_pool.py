@@ -1311,9 +1311,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                logger.debug(
+                    f"[MambaAlloc] REUSE existing slot rid={req.rid} "
+                    f"slot={req.mamba_pool_idx} avail={self.mamba_allocator.available_size()}"
+                )
                 pass
             else:
+                avail_before = self.mamba_allocator.available_size()
                 mid = self.mamba_allocator.alloc(1)
+                logger.debug(
+                    f"[MambaAlloc] ALLOC rid={req.rid} slot={mid[0] if mid is not None else None} "
+                    f"avail_before={avail_before} avail_after={self.mamba_allocator.available_size()} "
+                    f"pool_size={self.mamba_pool.size}"
+                )
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
@@ -1476,8 +1486,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
+        avail_before = self.mamba_allocator.available_size()
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
+        logger.debug(
+            f"[MambaFree] FREE rid={req.rid} slot={mamba_index} "
+            f"avail_before={avail_before} avail_after={self.mamba_allocator.available_size()} "
+            f"pool_size={self.mamba_pool.size}"
+        )
 
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
