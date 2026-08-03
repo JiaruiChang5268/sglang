@@ -288,7 +288,12 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # Use cache_protected_len (set at admission, NOT updated by HiCache
+        # restore) instead of len(req.prefix_indices) (which is extended by
+        # hicache_restored_kv_indices).  The restored tokens are accounted by
+        # a separate inc_lock_ref/dec_lock_ref pair in the HiCache flow, so
+        # including them here would double-decrement protected_size_.
+        self.tree_cache.protected_size_ -= req.cache_protected_len
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
