@@ -585,7 +585,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         )
-        # print(f"[UnifiedRadixCache] match_prefix: {result}")
+        # print(f"[UnifiedRadixCache] match_prefix: {len(result.device_indices)=}, {result.host_hit_length=}, {result.mamba_host_hit_length=}")
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:

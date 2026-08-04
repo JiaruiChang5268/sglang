@@ -16,7 +16,7 @@ sglang serve \
    --chunked-prefill-size -1 \
    --schedule-conservativeness 0.3 \
    --disable-overlap-schedule \
-   --mem-fraction-static 0.8 \
+   --mem-fraction-static 0.4 \
    --max-running-requests 48 \
    --cuda-graph-bs 8 16 24 32 48 \
    --enable-metrics \

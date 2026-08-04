@@ -12,7 +12,7 @@ sglang serve \
     --port 40000 \
     --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.4 \
     --max-running-requests 64 \
     --schedule-policy fcfs \
     --chunked-prefill-size -1 \
