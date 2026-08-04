@@ -561,6 +561,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            # print(f"[UnifiedRadixCache] try_match_prefix: {result}")
             return result
 
         key = params.key
@@ -577,13 +578,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         )
+        # print(f"[UnifiedRadixCache] match_prefix: {result}")
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:

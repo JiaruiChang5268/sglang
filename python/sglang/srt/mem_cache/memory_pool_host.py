@@ -1793,6 +1793,12 @@ class MambaPoolHost(HostKVCache):
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        # print(
+        #     f"[MambaPoolHost][INIT] host_size={self.size} device_size={device_pool.size} "
+        #     f"num_layers={self.num_mamba_layers} layout={self.layout} "
+        #     f"temporal_shape={tuple(device_pool.mamba_cache.temporal.shape)} "
+        #     f"conv_shapes={[tuple(c.shape) for c in device_pool.mamba_cache.conv]}"
+        # )
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -2034,6 +2040,13 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU fallback: no dedicated mamba host-transfer kernel, use torch indexing.
+            # Keep each indexing op's buffer/index/value on the same device, as
+            # torch_npu rejects mixed-device advanced indexing.
+            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
+                dst.device
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2069,6 +2082,11 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU fallback: page-first host buffer -> per-layer device buffer.
+            dst[dst_indices.to(dst.device)] = src[
+                src_indices.to(src.device), layer_id
+            ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2117,6 +2135,13 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU fallback: per-layer device buffers -> page-first host buffer.
+            for layer_id in range(num_layers):
+                src_layer = src_layers[layer_id]
+                dst[dst_indices.to(dst.device), layer_id] = src_layer[
+                    src_indices.to(src_layer.device)
+                ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2128,11 +2153,17 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        if io_backend != "direct":
+        if io_backend not in ["direct", "kernel_ascend"]:
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
+                f"MambaPoolHost only supports io_backend='direct' or 'kernel_ascend', "
                 f"got '{io_backend}'."
             )
+        # if layer_id == 0:
+        #     print(
+        #         f"[MambaPoolHost][L2-LOAD] slots={host_indices.numel()} "
+        #         f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
+        #         f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
+        #     )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
                 src=self.temporal_buffer,
@@ -2173,11 +2204,16 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend != "direct":
+        if io_backend not in ["direct", "kernel_ascend"]:
             raise ValueError(
-                f"MambaPoolHost only supports io_backend='direct', "
+                f"MambaPoolHost only supports io_backend='direct' or 'kernel_ascend', "
                 f"got '{io_backend}'."
             )
+        # print(
+        #     f"[MambaPoolHost][L2-BACKUP] slots={device_indices.numel()} "
+        #     f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
+        #     f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
+        # )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
                 src_layers=device_pool.mamba_cache.temporal,

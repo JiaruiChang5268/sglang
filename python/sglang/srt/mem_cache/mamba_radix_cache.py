@@ -504,7 +504,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        result = self._match_post_processor(params, value, last_node, best_value_len)
+        # print(f"[MambaRadixCache] match_prefix: {result}")
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
