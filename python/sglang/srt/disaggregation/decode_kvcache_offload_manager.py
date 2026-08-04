@@ -295,7 +295,11 @@ class DecodeKVCacheOffloadManager:
 
         self.req_to_token_pool.free(req)
         req.kv = None
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # HiCache restore extends prefix_indices without changing the prefix
+        # protected by this request. Restored tokens have their own lock-ref
+        # lifecycle, so counting them here would decrement protected_size_
+        # twice when the request is released.
+        self.tree_cache.protected_size_ -= req.cache_protected_len
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
