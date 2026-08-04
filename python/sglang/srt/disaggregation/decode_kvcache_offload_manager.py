@@ -299,12 +299,20 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        # Use cache_protected_len (set at admission, NOT updated by HiCache
-        # restore) instead of len(req.prefix_indices) (which is extended by
-        # hicache_restored_kv_indices).  The restored tokens are accounted by
-        # a separate inc_lock_ref/dec_lock_ref pair in the HiCache flow, so
-        # including them here would double-decrement protected_size_.
-        self.tree_cache.protected_size_ -= req.cache_protected_len
+        # Release the tree cache lock acquired at admission via
+        # _match_prefix_and_lock (inc_lock_ref).  dec_lock_ref properly
+        # updates lock_ref, protected_size_, and evictable_size_ together,
+        # keeping the invariant checker consistent.
+        #
+        # req.last_node tracks the currently-locked node:
+        #   - L1-only: last_node is the L1 prefix node (set at admission,
+        #     unchanged since needs_local_restore is False).
+        #   - L2/L3:   last_node is the restored node (updated by
+        #     _commit_hicache_local_restore_to_req, which already released
+        #     the L1 prefix node's lock via dec_lock_ref).  So this call
+        #     releases only the restored node's lock — no double-decrement.
+        if req.cache_protected_len > 0 and req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 
