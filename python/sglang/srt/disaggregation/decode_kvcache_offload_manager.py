@@ -264,12 +264,23 @@ class DecodeKVCacheOffloadManager:
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
+        #
+        # Skip the prefix tokens [0, cache_protected_len) which are
+        # managed by the tree cache via lock_ref.  These include:
+        #   - L1 device-hit tokens (shared tree cache slots, locked by
+        #     inc_lock_ref at admission)
+        #   - L2/L3 restored tokens (allocated by init_load_back, locked
+        #     by inc_lock_ref in the HiCache restore flow)
+        # Only free the delta prefill tokens that were allocated by
+        # _pre_alloc and are owned by this request.
         state = self.offloaded_state.get(req.rid)
         if state is not None and state.prefill_len > 0:
-            prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
-            ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
+            free_start = max(req.cache_protected_len, 0)
+            if free_start < state.prefill_len:
+                prefill_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, free_start : state.prefill_len
+                ]
+                self.token_to_kv_pool_allocator.free(prefill_indices)
         start = start_offset
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
