@@ -66,7 +66,11 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.kvcacheio import (
+        TransferDirection,
+        transfer_kv_dim_exchange,
+        transfer_mamba_state,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -2136,12 +2140,14 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            # NPU fallback: per-layer device buffers -> page-first host buffer.
-            for layer_id in range(num_layers):
-                src_layer = src_layers[layer_id]
-                dst[dst_indices.to(dst.device), layer_id] = src_layer[
-                    src_indices.to(src_layer.device)
-                ].to(dst.device)
+            # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
+            transfer_mamba_state(
+                device_buf=src_layers,
+                host_buf=dst,
+                device_indices=src_indices,
+                host_indices=dst_indices,
+                direction=TransferDirection.D2H,
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2165,25 +2171,43 @@ class MambaPoolHost(HostKVCache):
                 f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
             )
         if self.layout in ["page_first", "page_first_direct"]:
-            self._copy_tensor_pf_lf(
-                src=self.temporal_buffer,
-                dst=device_pool.mamba_cache.temporal[layer_id],
-                src_indices=host_indices,
-                dst_indices=device_indices,
-                layer_id=layer_id,
-                num_layers=self.num_mamba_layers,
-                io_backend=io_backend,
-            )
-            for conv_idx in range(len(self.conv_state_shapes)):
+            if io_backend == "kernel_ascend" and layer_id == 0:
+                # NPU: transfer all layers at once via dedicated kernel
+                transfer_mamba_state(
+                    device_buf=device_pool.mamba_cache.temporal,
+                    host_buf=self.temporal_buffer,
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    direction=TransferDirection.H2D,
+                )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    transfer_mamba_state(
+                        device_buf=device_pool.mamba_cache.conv[conv_idx],
+                        host_buf=self.conv_buffer[conv_idx],
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        direction=TransferDirection.H2D,
+                    )
+            else:
                 self._copy_tensor_pf_lf(
-                    src=self.conv_buffer[conv_idx],
-                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    src=self.temporal_buffer,
+                    dst=device_pool.mamba_cache.temporal[layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
                 )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor_pf_lf(
+                        src=self.conv_buffer[conv_idx],
+                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
@@ -3224,6 +3248,14 @@ class HostPoolGroup:
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
 
     @property
     def size_per_token(self):
