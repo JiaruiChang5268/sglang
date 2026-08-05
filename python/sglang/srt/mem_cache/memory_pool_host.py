@@ -69,8 +69,11 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import (
         TransferDirection,
         transfer_kv_dim_exchange,
-        transfer_mamba_state,
     )
+    try:
+        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+    except ImportError:
+        transfer_mamba_state = None
 
 logger = logging.getLogger(__name__)
 
@@ -2140,14 +2143,22 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
-            transfer_mamba_state(
-                device_buf=src_layers,
-                host_buf=dst,
-                device_indices=src_indices,
-                host_indices=dst_indices,
-                direction=TransferDirection.D2H,
-            )
+            if transfer_mamba_state is not None:
+                # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
+                transfer_mamba_state(
+                    device_buf=src_layers,
+                    host_buf=dst,
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                # Fallback: per-layer torch indexing when kernel is not available
+                for layer_id in range(num_layers):
+                    src_layer = src_layers[layer_id]
+                    dst[dst_indices.to(dst.device), layer_id] = src_layer[
+                        src_indices.to(src_layer.device)
+                    ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2171,7 +2182,7 @@ class MambaPoolHost(HostKVCache):
                 f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
             )
         if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel_ascend" and layer_id == 0:
+            if io_backend == "kernel_ascend" and layer_id == 0 and transfer_mamba_state is not None:
                 # NPU: transfer all layers at once via dedicated kernel
                 transfer_mamba_state(
                     device_buf=device_pool.mamba_cache.temporal,
