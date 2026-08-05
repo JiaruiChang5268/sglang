@@ -70,10 +70,6 @@ if _is_npu:
         TransferDirection,
         transfer_kv_dim_exchange,
     )
-    try:
-        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
-    except ImportError:
-        transfer_mamba_state = None
 
 logger = logging.getLogger(__name__)
 
@@ -2018,6 +2014,135 @@ class MambaPoolHost(HostKVCache):
             return 0
         return int(tensor[0].numel() * tensor.element_size())
 
+    # One-shot diagnostics for the kernel_ascend dim-exchange path.
+    _kernel_directions_printed: set = set()
+    _kernel_diag_printed = False
+
+    @staticmethod
+    def _kernel_diag(msg: str) -> None:
+        """Print (once) why the dim-exchange kernel path was skipped."""
+        if not MambaPoolHost._kernel_diag_printed:
+            MambaPoolHost._kernel_diag_printed = True
+            print(f"[MambaPoolHost] dim_exchange skipped: {msg}")
+
+    @staticmethod
+    def _try_dim_exchange(
+        device_tensor: torch.Tensor,
+        host_tensor: torch.Tensor,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        num_layers: int,
+        direction,
+    ) -> bool:
+        """Transfer a Mamba state buffer via the NPU dim-exchange kernel.
+
+        The kernel exchanges the layer dimension between the device layout
+        (num_layers, slots, 1, state_dim) and the host layout
+        (slots, num_layers, 1, state_dim). Returns False when the kernel is
+        not applicable so the caller can fall back to torch indexing.
+        """
+        if not _is_npu:
+            MambaPoolHost._kernel_diag("not an NPU runtime")
+            return False
+        if device_indices.numel() == 0 or host_indices.numel() == 0:
+            MambaPoolHost._kernel_diag("empty indices")
+            return False
+        if not isinstance(device_tensor, torch.Tensor):
+            MambaPoolHost._kernel_diag("device buffer is not a tensor")
+            return False
+        if (
+            device_tensor.dim() < 3
+            or host_tensor.dim() < 3
+            or device_tensor.shape[0] != num_layers
+            or host_tensor.shape[1] != num_layers
+        ):
+            MambaPoolHost._kernel_diag(
+                f"shape mismatch: device={tuple(device_tensor.shape)} "
+                f"host={tuple(host_tensor.shape)} num_layers={num_layers}"
+            )
+            return False
+        # State dims: device (num_layers, slots, 1, *state), host (slots, num_layers, 1, *state).
+        device_state = int(np.prod(device_tensor.shape[2:]))
+        host_state = int(np.prod(host_tensor.shape[3:]))
+        if device_state != host_state:
+            MambaPoolHost._kernel_diag(
+                f"state dim mismatch: device_state={device_state} host_state={host_state}"
+            )
+            return False
+        # aclrtMemcpy2dAsync requires the row width to be 32-byte aligned.
+        if (device_state * device_tensor.element_size()) % 32 != 0:
+            MambaPoolHost._kernel_diag(
+                f"row width not 32B-aligned: state_dim={device_state} "
+                f"itemsize={device_tensor.element_size()}"
+            )
+            return False
+        if direction not in MambaPoolHost._kernel_directions_printed:
+            MambaPoolHost._kernel_directions_printed.add(direction)
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[MambaPoolHost] using transfer_kv_dim_exchange "
+                    f"(state_dim={device_state}, num_layers={num_layers}, "
+                    f"direction={direction})"
+                )
+        transfer_kv_dim_exchange(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_tensor.reshape(
+                num_layers, device_tensor.shape[1], 1, 1, device_state
+            ),
+            host_k=host_tensor.reshape(
+                host_tensor.shape[0], num_layers, 1, 1, host_state
+            ),
+            device_v=torch.empty(0),
+            host_v=torch.empty(0),
+            page_size=1,
+            direction=direction,
+        )
+        return True
+
+    @staticmethod
+    def _copy_tensor_dim_exchange(
+        device_tensor: torch.Tensor,
+        host_tensor: torch.Tensor,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        num_layers: int,
+        direction,
+    ) -> None:
+        """Copy a whole Mamba state buffer between device and host.
+
+        Prefers the whole-layer dim-exchange kernel; falls back to per-layer
+        torch indexing when the kernel is not applicable. Each indexing op
+        keeps buffer/index/value on the same device because torch_npu rejects
+        mixed-device advanced indexing.
+        """
+        if MambaPoolHost._try_dim_exchange(
+            device_tensor,
+            host_tensor,
+            device_indices,
+            host_indices,
+            num_layers,
+            direction,
+        ):
+            return
+        if direction == TransferDirection.D2H:
+            # Device layer-first -> host page-first.
+            for layer_id in range(num_layers):
+                src_layer = device_tensor[layer_id]
+                host_tensor[host_indices.to(host_tensor.device), layer_id] = (
+                    src_layer[device_indices.to(src_layer.device)].to(
+                        host_tensor.device
+                    )
+                )
+        else:
+            # Host page-first -> device layer-first.
+            for layer_id in range(num_layers):
+                device_tensor[layer_id][device_indices.to(device_tensor.device)] = (
+                    host_tensor[host_indices.to(host_tensor.device), layer_id].to(
+                        device_tensor.device
+                    )
+                )
+
     @staticmethod
     def _copy_tensor(
         src: torch.Tensor,
@@ -2046,13 +2171,6 @@ class MambaPoolHost(HostKVCache):
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 page_size=1,
-            )
-        elif io_backend == "kernel_ascend":
-            # NPU fallback: no dedicated mamba host-transfer kernel, use torch indexing.
-            # Keep each indexing op's buffer/index/value on the same device, as
-            # torch_npu rejects mixed-device advanced indexing.
-            dst[dst_indices.to(dst.device)] = src[src_indices.to(src.device)].to(
-                dst.device
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
@@ -2089,11 +2207,6 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            # NPU fallback: page-first host buffer -> per-layer device buffer.
-            dst[dst_indices.to(dst.device)] = src[
-                src_indices.to(src.device), layer_id
-            ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -2143,24 +2256,37 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            if transfer_mamba_state is not None:
-                # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
-                transfer_mamba_state(
-                    device_buf=src_layers,
-                    host_buf=dst,
-                    device_indices=src_indices,
-                    host_indices=dst_indices,
-                    direction=TransferDirection.D2H,
-                )
-            else:
-                # Fallback: per-layer torch indexing when kernel is not available
-                for layer_id in range(num_layers):
-                    src_layer = src_layers[layer_id]
-                    dst[dst_indices.to(dst.device), layer_id] = src_layer[
-                        src_indices.to(src_layer.device)
-                    ].to(dst.device)
+            # Whole-layer dim-exchange kernel; per-layer torch fallback.
+            MambaPoolHost._copy_tensor_dim_exchange(
+                src_layers,
+                dst,
+                src_indices,
+                dst_indices,
+                num_layers,
+                TransferDirection.D2H,
+            )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    def _load_all_layers_kernel_ascend(self, device_pool, host_indices, device_indices):
+        """H2D load of all mamba state buffers in one shot (kernel_ascend only)."""
+        MambaPoolHost._copy_tensor_dim_exchange(
+            device_pool.mamba_cache.temporal,
+            self.temporal_buffer,
+            device_indices,
+            host_indices,
+            self.num_mamba_layers,
+            TransferDirection.H2D,
+        )
+        for conv_idx in range(len(self.conv_state_shapes)):
+            MambaPoolHost._copy_tensor_dim_exchange(
+                device_pool.mamba_cache.conv[conv_idx],
+                self.conv_buffer[conv_idx],
+                device_indices,
+                host_indices,
+                self.num_mamba_layers,
+                TransferDirection.H2D,
+            )
 
     def load_to_device_per_layer(
         self,
@@ -2181,44 +2307,34 @@ class MambaPoolHost(HostKVCache):
                 f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
                 f"io_backend={io_backend} num_layers={self.num_mamba_layers}"
             )
-        if self.layout in ["page_first", "page_first_direct"]:
-            if io_backend == "kernel_ascend" and layer_id == 0 and transfer_mamba_state is not None:
-                # NPU: transfer all layers at once via dedicated kernel
-                transfer_mamba_state(
-                    device_buf=device_pool.mamba_cache.temporal,
-                    host_buf=self.temporal_buffer,
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    direction=TransferDirection.H2D,
+        if io_backend == "kernel_ascend":
+            # The dim-exchange kernel transfers all layers in one call; do it
+            # once at layer_id == 0 and skip the remaining per-layer calls.
+            if layer_id == 0:
+                self._load_all_layers_kernel_ascend(
+                    device_pool, host_indices, device_indices
                 )
-                for conv_idx in range(len(self.conv_state_shapes)):
-                    transfer_mamba_state(
-                        device_buf=device_pool.mamba_cache.conv[conv_idx],
-                        host_buf=self.conv_buffer[conv_idx],
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        direction=TransferDirection.H2D,
-                    )
-            else:
+            return
+        if self.layout in ["page_first", "page_first_direct"]:
+            self._copy_tensor_pf_lf(
+                src=self.temporal_buffer,
+                dst=device_pool.mamba_cache.temporal[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                num_layers=self.num_mamba_layers,
+                io_backend=io_backend,
+            )
+            for conv_idx in range(len(self.conv_state_shapes)):
                 self._copy_tensor_pf_lf(
-                    src=self.temporal_buffer,
-                    dst=device_pool.mamba_cache.temporal[layer_id],
+                    src=self.conv_buffer[conv_idx],
+                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     layer_id=layer_id,
                     num_layers=self.num_mamba_layers,
                     io_backend=io_backend,
                 )
-                for conv_idx in range(len(self.conv_state_shapes)):
-                    self._copy_tensor_pf_lf(
-                        src=self.conv_buffer[conv_idx],
-                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=layer_id,
-                        num_layers=self.num_mamba_layers,
-                        io_backend=io_backend,
-                    )
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
@@ -2244,7 +2360,7 @@ class MambaPoolHost(HostKVCache):
                 f"MambaPoolHost only supports io_backend='direct' or 'kernel_ascend', "
                 f"got '{io_backend}'."
             )
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank() == 0 and device_indices.numel() > 0:
             print(
                 f"[MambaPoolHost][L2-BACKUP] slots={device_indices.numel()} "
                 f"host_idx_dev={host_indices.device} dev_idx_dev={device_indices.device} "
