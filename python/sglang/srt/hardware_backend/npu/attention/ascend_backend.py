@@ -47,6 +47,63 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
+def _ring_mla_pytorch_fallback(
+        q_nope,
+        q_rope,
+        k_nope,
+        k_rope,
+        v,
+        k_nope_pre,
+        k_rope_pre,
+        v_pre,
+        extend_lens,
+        prefix_lens,
+        q_heads,
+        kv_heads,
+        scale,
+):
+    """ Pure-PyTorch replacement for torch_npu.atb.npu_ring_mla.
+
+    Computes MLA attention in one pass: prefix KV columns are fully visible,
+    extend columns are causal with in each sequence. Used when the ATB ring
+    kernel is unavailable.
+    """
+    q = torch.cat([q_nope, q_rope], dim=-1) # [T, qh, d]
+    k_ext = torch.cat([k_nope, k_rope], dim=-1) # [T, kh, d]
+    v_ext = v
+    if k_nope_pre is not None and k_nope_pre.numel() > 0:
+        k_pre = torch.cat([k_nope_pre, k_rope_pre], dim=-1)
+        k_full = torch.cat([k_pre, k_ext], dim=0)
+        v_full = torch.cat([v_pre, v_ext], dim=0)
+        pre_lens = list(prefix_lens)
+    else:
+        k_full, v_full = k_ext, v_ext
+        pre_lens = [0] * len(extend_lens)
+
+    # GQA: broadcast kv heads to q heads
+    assert q_heads % kv_heads == 0, f"q_heads={q_heads} % kv_heads={kv_heads}"
+    k = k_full.repeat_interleave(q_heads // kv_heads, dim=1)
+    v = v_full.repeat_interleave(q_heads // kv_heads, dim=1)
+
+    # Mask: prefix columns visible, extend columns causal per sequence.
+    T, total_kv = q.shape[0], k_full.shape[0]
+    neg_inf = -65504.0 if q.dtype == torch.bfloat16 else float("-inf")
+    mask = torch.full((T, total_kv), neg_inf, dtype=q.dtype, device=q.device)
+    q_row = 0
+    kv_col = 0
+    for ext_len, pre_len in zip(extend_lens, pre_lens):
+        mask[q_row : q_row + ext_len, kv_col : kv_col + pre_len] = 0.0
+        kv_col += pre_len
+        for i in range(ext_len):
+            mask[q_row +i, kv_col : kv_col + i + 1] = 0.0
+        kv_col += ext_len
+        q_row += ext_len
+
+    # q: [T, qh, d], k: [K, qh, d] -> scores: [T, qh, K]
+    scores = torch.einsum("thd,khd->thk", q, k) * scale
+    scores = scores + mask.unsqueeze(1) # [T, 1, k] -> broadcast over heads
+    # v: [K, qh, vd] -> out: [T, qh, vd]
+    return torch.einsum("thk,khv->thv", torch.softmax(scores, dim=-1), v)
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     return (
@@ -1711,25 +1768,35 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=torch.float32,
                     device=q_nope.device,
                 )
-                torch_npu.atb.npu_ring_mla(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    k_nope=k_nope,
-                    k_rope=k_rope,
-                    value=v,
-                    mask=self.ringmla_mask,
-                    seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
-                    head_num=layer.tp_q_head_num,
-                    kv_head_num=layer.tp_k_head_num,
-                    pre_out=None,
-                    prev_lse=None,
-                    qk_scale=layer.scaling,
-                    kernel_type="kernel_type_high_precision",
-                    mask_type="mask_type_triu",
-                    calc_type="calc_type_first_ring",
-                    output=attn_output,
-                    softmax_lse=attn_lse,
-                )
+                # Save extend KV for the PyTorch fallback (stage 2 overwrites
+                # k_nope/k_rope/v with prefix history).
+                k_nope_ext, k_rope_ext, v_ext = k_nope, k_rope, v
+                _ring_mla_ok = True
+                try:
+                    torch_npu.atb.npu_ring_mla(
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        k_nope=k_nope,
+                        k_rope=k_rope,
+                        value=v,
+                        mask=self.ringmla_mask,
+                        seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
+                        head_num=layer.tp_q_head_num,
+                        kv_head_num=layer.tp_k_head_num,
+                        pre_out=None,
+                        prev_lse=None,
+                        qk_scale=layer.scaling,
+                        kernel_type="kernel_type_high_precision",
+                        mask_type="mask_type_triu",
+                        calc_type="calc_type_first_ring",
+                        output=attn_output,
+                        softmax_lse=attn_lse,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "npu_ring_mla stage-1 failed, falling back to PyTorch MLA"
+                    )
+                    _ring_mla_ok = False
 
                 # 2nd, load history kvcache(kv_a and k_pe) and calculate k_nope
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1749,31 +1816,69 @@ class AscendAttnBackend(AttentionBackend):
 
                 # 3rd, compute history kv to attn_out
                 k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-                seq_len = torch.stack(
-                    [
-                        self.forward_metadata.extend_seq_lens_cpu_int,
-                        self.forward_metadata.prefix_lens,
-                    ]
-                )
-                torch_npu.atb.npu_ring_mla(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    k_nope=k_nope,
-                    k_rope=k_rope,
-                    value=v,
-                    mask=self.ringmla_mask,
-                    seqlen=seq_len,
-                    head_num=layer.tp_q_head_num,
-                    kv_head_num=layer.tp_k_head_num,
-                    pre_out=attn_output,
-                    prev_lse=attn_lse,
-                    qk_scale=layer.scaling,
-                    kernel_type="kernel_type_high_precision",
-                    mask_type="no_mask",
-                    calc_type="calc_type_default",
-                    output=attn_output,
-                    softmax_lse=attn_lse,
-                )
+                if not _ring_mla_ok:
+                    # Stage-1 already failed: run the full PyTorch fallback.
+                    attn_output = _ring_mla_pytorch_fallback(
+                        q_nope,
+                        q_rope,
+                        k_nope_ext,
+                        k_rope_ext,
+                        v_ext,
+                        k_nope,
+                        k_rope,
+                        v,
+                        list(self.forward_metadata.extend_seq_lens_cpu_int),
+                        list(self.forward_metadata.prefix_lens),
+                        layer.tp_q_head_num,
+                        layer.tp_k_head_num,
+                        layer.scaling,
+                    )
+                else:
+                    seq_len = torch.stack(
+                        [
+                            self.forward_metadata.extend_seq_lens_cpu_int,
+                            self.forward_metadata.prefix_lens,
+                        ]
+                    )
+                    try:
+                        torch_npu.atb.npu_ring_mla(
+                            q_nope=q_nope,
+                            q_rope=q_rope,
+                            k_nope=k_nope,
+                            k_rope=k_rope,
+                            value=v,
+                            mask=self.ringmla_mask,
+                            seqlen=seq_len,
+                            head_num=layer.tp_q_head_num,
+                            kv_head_num=layer.tp_k_head_num,
+                            pre_out=attn_output,
+                            prev_lse=attn_lse,
+                            qk_scale=layer.scaling,
+                            kernel_type="kernel_type_high_precision",
+                            mask_type="no_mask",
+                            calc_type="calc_type_default",
+                            output=attn_output,
+                            softmax_lse=attn_lse,
+                        )
+                    except RuntimeError:
+                        logger.warning(
+                            "npu_ring_mla stage-2 failed, falling back to PyTorch MLA"
+                        )
+                        attn_output = _ring_mla_pytorch_fallback(
+                            q_nope,
+                            q_rope,
+                            k_nope_ext,
+                            k_rope_ext,
+                            v_ext,
+                            k_nope,
+                            k_rope,
+                            v,
+                            list(self.forward_metadata.extend_seq_lens_cpu_int),
+                            list(self.forward_metadata.prefix_lens),
+                            layer.tp_q_head_num,
+                            layer.tp_k_head_num,
+                            layer.scaling,
+                        )
                 attn_output = attn_output.reshape(
                     [-1, layer.tp_q_head_num, layer.v_head_dim]
                 )
