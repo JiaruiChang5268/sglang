@@ -155,13 +155,27 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        # The Ascend update kernel expects the conv state in the weight dtype
+        # (K3 keeps conv weights in FP32 while the persistent cache is BF16).
+        # Run the update on a compact FP32 working set of the active rows and
+        # cast the updated state back into the BF16 cache.
+        local_indices = torch.arange(
+            cache_indices.shape[0],
+            device=cache_indices.device,
+            dtype=cache_indices.dtype,
+        )
+        state_work = conv_states.index_select(0, cache_indices.to(torch.int64))
+        state_work = state_work.to(layer.conv_weights.dtype).contiguous()
         qkv = causal_conv1d_update_npu(
             mixed_qkv,
-            conv_states,
+            state_work,
             layer.conv_weights,
             layer.bias,
             activation="silu",
-            conv_state_indices=cache_indices,
+            conv_state_indices=local_indices,
+        )
+        conv_states.index_copy_(
+            0, cache_indices.to(torch.int64), state_work.to(conv_states.dtype)
         )
 
         if self.kernel_dispatcher.supports_packed_decode:
